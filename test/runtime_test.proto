@@ -1,0 +1,33 @@
+syntax = "proto3";
+package pbmysql.test;
+import "proto2mysql_option.proto";
+option (proto2mysql.db) = true;
+
+message RuntimeRow {
+  option (proto2mysql.table_name) = "runtime_rows";
+  option (proto2mysql.primary_key) = "id";
+  option (proto2mysql.unique_key) = "email";
+  uint64 id = 1;
+  string email = 2;
+  uint64 gold = 3;
+  uint64 epoch = 4;
+  uint64 seq = 5;
+  bytes data = 6;
+  optional int32 explicit_zero = 7;
+}
+message RuntimeRows { repeated RuntimeRow items = 1; }
+message CollectionRow {
+  option (proto2mysql.table_name) = "collection_rows";
+  option (proto2mysql.primary_key) = "id";
+  uint64 id = 1;
+  uint64 version = 2;
+  repeated string tags = 3;
+  map<string, uint64> counts = 4;
+}
+message CompositeRow {
+  option (proto2mysql.table_name) = "composite_rows";
+  option (proto2mysql.primary_key) = "realm,id";
+  string realm = 1;
+  string id = 2;
+  string value = 3;
+}

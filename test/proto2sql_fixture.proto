@@ -1,0 +1,25 @@
+syntax = "proto3";
+package cli_fixture;
+import "proto2mysql_option.proto";
+import "db_base.proto";
+option (proto2mysql.db) = true;
+
+message Modern {
+  option (proto2mysql.table_name) = "cli_modern";
+  option (proto2mysql.primary_key) = "id";
+  uint64 id = 1;
+  string name = 2;
+}
+message Container {
+  message Nested {
+    option (proto2mysql.table_name) = "cli_nested";
+    option (proto2mysql.primary_key) = "id";
+    uint64 id = 1;
+  }
+}
+message Legacy {
+  option (OptionTableName) = "cli_legacy";
+  option (OptionPrimaryKey) = "id";
+  uint64 id = 1;
+}
+message Skipped { uint64 id = 1; }

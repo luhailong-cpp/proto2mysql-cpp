@@ -1,0 +1,30 @@
+name: C++ tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: proto2mysql_test
+          MYSQL_DATABASE: proto2mysql_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      PBMYSQL_TEST_HOST: 127.0.0.1
+      PBMYSQL_TEST_PORT: 3306
+      PBMYSQL_TEST_USER: root
+      PBMYSQL_TEST_PASSWORD: proto2mysql_test
+      PBMYSQL_TEST_DATABASE: proto2mysql_test
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libprotobuf-dev protobuf-compiler default-libmysqlclient-dev libgtest-dev
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure

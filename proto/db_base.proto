@@ -3,7 +3,7 @@ option optimize_for = SPEED;
 		
 option go_package = "github.com/luyuancpp/dbprotootopn;db";
 
-import "descriptor.proto";
+import "google/protobuf/descriptor.proto";
 
 //option id  要从50000开始 50000以内pb内部使用
 
