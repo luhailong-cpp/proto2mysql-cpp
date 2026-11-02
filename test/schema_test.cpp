@@ -424,10 +424,11 @@ TEST(SchemaMigration, ModernOptionsFallbackAndCheckedOfflineDDL) {
     f.message->mutable_options()->ClearExtension(proto2mysql::primary_key);
     auto *opts = f.message->mutable_options();
     auto *u = opts->GetReflection()->MutableUnknownFields(opts);
-    u->AddLengthDelimited(500001, "wire_record");
-    u->AddLengthDelimited(500002, "name");
+    u->AddLengthDelimited(proto2mysql::kTableNameFieldNumber, "wire_record");
+    u->AddLengthDelimited(proto2mysql::kPrimaryKeyFieldNumber, "name");
     auto *fieldopts = f.message->mutable_field(1)->mutable_options();
-    fieldopts->GetReflection()->MutableUnknownFields(fieldopts)->AddVarint(600101, 37);
+    fieldopts->GetReflection()->MutableUnknownFields(fieldopts)->AddVarint(
+        proto2mysql::kMaxLengthFieldNumber, 37);
     const auto &prototype = f.Build();
     MessageTable table(prototype);
     EXPECT_EQ(table.TableName(), "wire_record");

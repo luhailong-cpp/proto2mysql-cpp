@@ -1,3 +1,5 @@
+#include "db_base.pb.h"
+#include "proto2mysql_option.pb.h"
 #include "src/mysql_wrapper/descriptor_registry.h"
 #include "src/mysql_wrapper/identifier_utils.h"
 #include "src/mysql_wrapper/message_table.h"
@@ -57,8 +59,9 @@ std::string OptionString(const google::protobuf::MessageOptions &options, int nu
 }
 void Collect(const google::protobuf::Descriptor *message,
              std::vector<const google::protobuf::Descriptor *> &output) {
-    if (!message->options().map_entry() && (!OptionString(message->options(), 500001).empty() ||
-                                            !OptionString(message->options(), 50001).empty()))
+    if (!message->options().map_entry() &&
+        (!OptionString(message->options(), proto2mysql::kTableNameFieldNumber).empty() ||
+         !OptionString(message->options(), ::kOptionTableNameFieldNumber).empty()))
         output.push_back(message);
     for (int i = 0; i < message->nested_type_count(); ++i)
         Collect(message->nested_type(i), output);

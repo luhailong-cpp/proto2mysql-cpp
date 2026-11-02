@@ -1,3 +1,4 @@
+#include "proto2mysql_option.pb.h"
 #include "src/mysql_wrapper/sql_builder.h"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
@@ -30,8 +31,8 @@ class BuilderFixture : public ::testing::Test {
         message->set_name("Row");
         auto *unknown = message->mutable_options()->GetReflection()->MutableUnknownFields(
             message->mutable_options());
-        unknown->AddLengthDelimited(500001, "items");
-        unknown->AddLengthDelimited(500002, "id");
+        unknown->AddLengthDelimited(proto2mysql::kTableNameFieldNumber, "items");
+        unknown->AddLengthDelimited(proto2mysql::kPrimaryKeyFieldNumber, "id");
         auto add = [&](const char *name, int number, FieldDescriptorProto::Type type,
                        bool repeated = false) {
             auto *f = message->add_field();

@@ -400,29 +400,34 @@ MessageTable::MessageTable(const Message &source, const TableOptions &o)
         unique_keys_ = options_.GetExtension(OptionUniqueKey);
     if (options_.HasExtension(OptionAutoIncrementKey))
         auto_increment_key_ = options_.GetExtension(OptionAutoIncrementKey);
-    if (auto value = ReadTextOption(options_, 500001))
+    if (auto value = ReadTextOption(options_, proto2mysql::kTableNameFieldNumber))
         table_name_ = *value;
-    if (auto value = ReadTextOption(options_, 500002))
+    if (auto value = ReadTextOption(options_, proto2mysql::kPrimaryKeyFieldNumber))
         primary_key_ = Split(*value, ',');
-    if (auto value = ReadTextOption(options_, 500011))
+    if (auto value = ReadTextOption(options_, proto2mysql::kIndexFieldNumber))
         indexes_ = Split(*value, ';');
-    if (auto value = ReadTextOption(options_, 500012))
+    if (auto value = ReadTextOption(options_, proto2mysql::kUniqueKeyFieldNumber))
         unique_keys_ = Trim(*value);
-    if (auto value = ReadTextOption(options_, 500006))
+    if (auto value = ReadTextOption(options_, proto2mysql::kAutoIncrementKeyFieldNumber))
         auto_increment_key_ = Trim(*value);
-    tidb_nonclustered_pk_ = ReadBoolOption(options_, 500021).value_or(false);
-    tidb_shard_row_id_bits_ = ReadUIntOption(options_, 500022).value_or(0);
-    tidb_pre_split_regions_ = ReadUIntOption(options_, 500023).value_or(0);
-    tidb_auto_id_cache_one_ = ReadBoolOption(options_, 500024).value_or(false);
+    tidb_nonclustered_pk_ =
+        ReadBoolOption(options_, proto2mysql::kTidbNonclusteredPkFieldNumber).value_or(false);
+    tidb_shard_row_id_bits_ =
+        ReadUIntOption(options_, proto2mysql::kTidbShardRowIdBitsFieldNumber).value_or(0);
+    tidb_pre_split_regions_ =
+        ReadUIntOption(options_, proto2mysql::kTidbPreSplitRegionsFieldNumber).value_or(0);
+    tidb_auto_id_cache_one_ =
+        ReadBoolOption(options_, proto2mysql::kTidbAutoIdCacheOneFieldNumber).value_or(false);
     for (int i = 0; i < descriptor_->field_count(); ++i) {
         auto *f = descriptor_->field(i);
-        if (ReadBoolOption(f->options(), 600100).value_or(false))
+        if (ReadBoolOption(f->options(), proto2mysql::kNullableFieldNumber).value_or(false))
             nullable_fields_.push_back(std::string(f->name()));
-        if (auto value = ReadUIntOption(f->options(), 600101))
+        if (auto value = ReadUIntOption(f->options(), proto2mysql::kMaxLengthFieldNumber))
             max_lengths_[std::string(f->name())] = *value;
     }
     // Preserve the historic first-column default for legacy declarations only.
-    if (primary_key_.empty() && !ReadTextOption(options_, 500001) && descriptor_->field_count())
+    if (primary_key_.empty() && !ReadTextOption(options_, proto2mysql::kTableNameFieldNumber) &&
+        descriptor_->field_count())
         primary_key_.push_back(std::string(descriptor_->field(0)->name()));
     if (o.table_name)
         table_name_ = *o.table_name;

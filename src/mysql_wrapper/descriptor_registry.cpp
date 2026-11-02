@@ -49,7 +49,7 @@ bool FileHasDBOption(const google::protobuf::FileDescriptor *file) {
         return options.GetExtension(proto2mysql::db);
     const auto &unknown = options.GetReflection()->GetUnknownFields(options);
     for (int i = unknown.field_count() - 1; i >= 0; --i)
-        if (unknown.field(i).number() == 500000 &&
+        if (unknown.field(i).number() == proto2mysql::kDbFieldNumber &&
             unknown.field(i).type() == google::protobuf::UnknownField::TYPE_VARINT)
             return unknown.field(i).varint() != 0;
     return false;
@@ -57,7 +57,7 @@ bool FileHasDBOption(const google::protobuf::FileDescriptor *file) {
 std::optional<std::string> TableNameFromDescriptor(const google::protobuf::Descriptor *descriptor) {
     if (!descriptor)
         throw std::invalid_argument("null message descriptor");
-    auto name = StringOption(descriptor->options(), 500001);
+    auto name = StringOption(descriptor->options(), proto2mysql::kTableNameFieldNumber);
     return name && !name->empty() ? name : std::nullopt;
 }
 void RegisterProtoFile(const google::protobuf::FileDescriptor *file) {
