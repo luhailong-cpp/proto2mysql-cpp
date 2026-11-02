@@ -1,6 +1,7 @@
 #include "proto2mysql_option.pb.h"
 #include "runtime_test.pb.h"
 #include "src/mysql_wrapper/database.h"
+#include "src/mysql_wrapper/database_limits.h"
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -27,10 +28,12 @@ class SchemaIntegration : public ::testing::Test {
         table = "p2m_schema_" +
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
                 std::to_string(sequence++);
-        db.Connect(Setting("PBMYSQL_TEST_HOST", "127.0.0.1"), Setting("PBMYSQL_TEST_USER", "root"),
-                   Setting("PBMYSQL_TEST_PASSWORD", ""),
-                   Setting("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
-                   static_cast<unsigned>(std::stoul(Setting("PBMYSQL_TEST_PORT", "3306"))));
+        const auto default_port = std::to_string(MYSQL_PORT);
+        db.Connect(
+            Setting("PBMYSQL_TEST_HOST", "127.0.0.1"), Setting("PBMYSQL_TEST_USER", "root"),
+            Setting("PBMYSQL_TEST_PASSWORD", ""),
+            Setting("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
+            static_cast<unsigned>(std::stoul(Setting("PBMYSQL_TEST_PORT", default_port.c_str()))));
         db.SetDbName(Setting("PBMYSQL_TEST_DATABASE", "proto2mysql_test"));
     }
     void TearDown() override {
@@ -96,7 +99,8 @@ TEST_F(SchemaIntegration, LegacyUniqueMigrationPreservesRowsAndOnlyExecutesOnExp
     db.Execute("ALTER TABLE " + QuoteIdentifier(table) +
                " MODIFY COLUMN `email` MEDIUMTEXT COMMENT 'pb:2'");
     db.Execute("ALTER TABLE " + QuoteIdentifier(table) + " ADD UNIQUE KEY " +
-               QuoteIdentifier("uk_" + table) + " (`email`(191))");
+               QuoteIdentifier("uk_" + table) + " (`email`(" + std::to_string(kDefaultKeyLength) +
+               "))");
     db.Execute(Statement{"INSERT INTO " + QuoteIdentifier(table) +
                              " (`id`,`email`,`gold`) VALUES (?,?,?),(?,?,?)",
                          {uint64_t{1}, std::string("Keep Case "), uint64_t{99}, uint64_t{2},
@@ -108,7 +112,8 @@ TEST_F(SchemaIntegration, LegacyUniqueMigrationPreservesRowsAndOnlyExecutesOnExp
                               "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='" +
                               table + "' AND COLUMN_NAME='email'");
     ASSERT_TRUE(before);
-    EXPECT_EQ(std::string((*before)[0]), "YES");
+    enum MetadataColumn { Nullable, Type };
+    EXPECT_EQ(std::string((*before)[Nullable]), "YES");
     ExecuteReport(report);
     EXPECT_TRUE(db.GenerateMigrationSql(Row::default_instance()).empty());
     Row loaded;
@@ -133,8 +138,9 @@ TEST_F(SchemaIntegration,
        ShadowPrimaryMigrationPreservesWideDataExtraIndexAndAutoIncrementWatermark) {
     const auto &prototype = ShadowPrototype();
     db.RegisterTable(prototype);
-    db.Execute("CREATE TABLE " + QuoteIdentifier(table) +
-               " (`name` VARCHAR(191) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT "
+    db.Execute("CREATE TABLE " + QuoteIdentifier(table) + " (`name` VARCHAR(" +
+               std::to_string(kDefaultKeyLength) +
+               ") COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT "
                "'pb:1', `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'pb:2', `counter` "
                "BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'pb:3', `data` LONGBLOB COMMENT 'pb:4', "
                "PRIMARY KEY (`name`), KEY " +
@@ -154,8 +160,9 @@ TEST_F(SchemaIntegration,
     auto row = db.QueryOne("SELECT `id`,`counter`,`data` FROM " + QuoteIdentifier(table) +
                            " WHERE `name`='Name '");
     ASSERT_TRUE(row);
-    EXPECT_EQ(std::string((*row)[1]), "5000000000");
-    EXPECT_EQ(std::string((*row)[2], row->length(2)), payload);
+    enum ResultColumn { Id, Counter, Data };
+    EXPECT_EQ(std::string((*row)[Counter]), "5000000000");
+    EXPECT_EQ(std::string((*row)[Data], row->length(Data)), payload);
     db.Execute(Statement{"INSERT INTO " + QuoteIdentifier(table) + " (`name`) VALUES (?)",
                          {std::string("next")}});
     EXPECT_GE(db.LastInsertId(), 10001u);
@@ -171,8 +178,9 @@ TEST_F(SchemaIntegration, MissingPrimaryAndAutoIncrementColumnAreAddedWithDepend
     // Missing id is a secondary-index auto column: its new index is installed
     // in the same ALTER. Ordinary string PK remains a full binary key.
     db.Execute(
-        "CREATE TABLE " + QuoteIdentifier(table) +
-        " (`name` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' "
+        "CREATE TABLE " + QuoteIdentifier(table) + " (`name` VARCHAR(" +
+        std::to_string(kDefaultKeyLength) +
+        ") CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' "
         "COMMENT 'pb:1', `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'pb:2', `counter` "
         "INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'pb:3', `data` MEDIUMBLOB COMMENT 'pb:4', KEY " +
         QuoteIdentifier("idx_" + table + "_0") + " (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");

@@ -10,10 +10,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -28,6 +30,20 @@
 
 namespace {
 namespace fs = std::filesystem;
+constexpr int kTemporaryDirectoryAttempts = 100;
+constexpr unsigned char kFirstPrintableAscii = 0x20;
+constexpr std::string_view kSerialDevicePrefix = "COM";
+constexpr std::string_view kPrinterDevicePrefix = "LPT";
+constexpr std::string_view kShortImportFlag = "-I";
+#ifdef _WIN32
+constexpr std::size_t kInitialExecutablePathCapacity = 512;
+// Win32 extended paths allow 32767 UTF-16 code units plus the terminating NUL.
+constexpr std::size_t kMaxWindowsPathCapacity = 32768;
+constexpr std::size_t kPathBufferGrowthFactor = 2;
+constexpr std::size_t kWindowsBackslashEscapeMultiplier = 2;
+#else
+constexpr int kExecFailureExitCode = 127;
+#endif
 std::string PathUtf8(const fs::path &path) {
     const auto bytes = path.u8string();
     return std::string(bytes.begin(), bytes.end());
@@ -99,7 +115,7 @@ void ValidateFileName(const std::string &name) {
         name.back() == ' ')
         throw std::invalid_argument("unsafe output filename: " + name);
     for (unsigned char c : name)
-        if (c < 0x20 || std::string("<>:\"/\\|?*").find(c) != std::string::npos)
+        if (c < kFirstPrintableAscii || std::string("<>:\"/\\|?*").find(c) != std::string::npos)
             throw std::invalid_argument("unsafe output filename: " + name);
     auto base = name.substr(0, name.find('.'));
     while (!base.empty() && base.back() == ' ')
@@ -109,15 +125,18 @@ void ValidateFileName(const std::string &name) {
     const std::set<std::string> devices{"CON",    "PRN",     "AUX",  "NUL",  "CLOCK$",
                                         "CONIN$", "CONOUT$", "COM¹", "COM²", "COM³",
                                         "LPT¹",   "LPT²",    "LPT³"};
-    if (devices.count(base) ||
-        (base.size() == 4 && (base.substr(0, 3) == "COM" || base.substr(0, 3) == "LPT") &&
-         base[3] >= '1' && base[3] <= '9'))
+    const std::string_view device(base);
+    constexpr auto number_position = kSerialDevicePrefix.size();
+    if (devices.count(base) || (device.size() == number_position + 1 &&
+                                (device.substr(0, number_position) == kSerialDevicePrefix ||
+                                 device.substr(0, number_position) == kPrinterDevicePrefix) &&
+                                device[number_position] >= '1' && device[number_position] <= '9'))
         throw std::invalid_argument("reserved output filename: " + name);
     (void)pbmysql::FoldIdentifier(name);
 }
 fs::path UniqueDirectory(const fs::path &parent) {
     std::random_device random;
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < kTemporaryDirectoryAttempts; ++i) {
         auto candidate =
             parent / (".proto2sql-" + std::to_string(random()) + "-" + std::to_string(random()));
         if (fs::create_directory(candidate))
@@ -137,15 +156,15 @@ struct TemporaryDirectory {
 };
 fs::path ExecutableDirectory(const char *argument) {
 #ifdef _WIN32
-    std::vector<wchar_t> buffer(512);
-    while (buffer.size() <= 32768) {
+    std::vector<wchar_t> buffer(kInitialExecutablePathCapacity);
+    while (buffer.size() <= kMaxWindowsPathCapacity) {
         const auto size =
             GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
         if (!size)
             break;
         if (size < buffer.size())
             return fs::path(std::wstring(buffer.data(), size)).parent_path();
-        buffer.resize(buffer.size() * 2);
+        buffer.resize(buffer.size() * kPathBufferGrowthFactor);
     }
 #elif defined(__linux__)
     std::error_code error;
@@ -165,18 +184,27 @@ fs::path ExecutableDirectory(const char *argument) {
 }
 #ifdef _WIN32
 std::string Utf8(const wchar_t *text) {
-    const int size =
-        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, nullptr, 0, nullptr, nullptr);
+    const std::wstring_view input(text);
+    if (input.empty())
+        return {};
+    if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error("UTF-16 process argument exceeds conversion limit");
+    const auto length = static_cast<int>(input.size());
+    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, input.data(), length,
+                                         nullptr, 0, nullptr, nullptr);
     if (size <= 0)
         throw std::invalid_argument("invalid UTF-16 process argument");
     std::string value(static_cast<size_t>(size), '\0');
-    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, value.data(), size, nullptr,
-                             nullptr))
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, input.data(), length, value.data(),
+                             size, nullptr, nullptr))
         throw std::invalid_argument("cannot convert process argument to UTF-8");
-    value.pop_back();
     return value;
 }
 std::wstring Wide(const std::string &text) {
+    if (text.empty())
+        return {};
+    if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error("UTF-8 process argument exceeds conversion limit");
     const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
                                          static_cast<int>(text.size()), nullptr, 0);
     if (size == 0 && !text.empty())
@@ -194,13 +222,13 @@ std::wstring QuoteArg(const std::wstring &text) {
             ++slashes;
             continue;
         }
-        quoted.append(slashes * (c == L'"' ? 2 : 1), L'\\');
+        quoted.append(slashes * (c == L'"' ? kWindowsBackslashEscapeMultiplier : 1), L'\\');
         slashes = 0;
         if (c == L'"')
             quoted += L'\\';
         quoted += c;
     }
-    quoted.append(slashes * 2, L'\\');
+    quoted.append(slashes * kWindowsBackslashEscapeMultiplier, L'\\');
     return quoted + L'"';
 }
 #endif
@@ -220,7 +248,7 @@ void Run(const std::vector<std::string> &arguments) {
         throw std::runtime_error("cannot start protoc");
     CloseHandle(process.hThread);
     WaitForSingleObject(process.hProcess, INFINITE);
-    DWORD code = 1;
+    DWORD code = EXIT_FAILURE;
     GetExitCodeProcess(process.hProcess, &code);
     CloseHandle(process.hProcess);
     if (code != 0)
@@ -235,7 +263,7 @@ void Run(const std::vector<std::string> &arguments) {
             argv.push_back(const_cast<char *>(argument.c_str()));
         argv.push_back(nullptr);
         execvp(argv[0], argv.data());
-        _exit(127);
+        _exit(kExecFailureExitCode);
     }
     int status = 0;
     while (waitpid(child, &status, 0) == -1)
@@ -442,9 +470,10 @@ Config Parse(int argc, char **argv) {
                 cfg.drop = flag;
             continue;
         }
-        if (arg.rfind("-I", 0) == 0 && arg.size() > 2 && !inline_value) {
-            value = arg.substr(2);
-            arg = "-I";
+        if (arg.rfind(kShortImportFlag.data(), 0) == 0 && arg.size() > kShortImportFlag.size() &&
+            !inline_value) {
+            value = arg.substr(kShortImportFlag.size());
+            arg = kShortImportFlag;
             inline_value = true;
         }
         if (!inline_value) {

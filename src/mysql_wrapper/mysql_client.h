@@ -65,7 +65,7 @@ class MysqlClient {
                 static_cast<unsigned int>(info.db_port()));
     }
     void Connect(const std::string &host, const std::string &user, const std::string &password,
-                 const std::string &database, unsigned int port = 3306);
+                 const std::string &database, unsigned int port = MYSQL_PORT);
     void Connect(const std::string &host, const std::string &user, const std::string &password,
                  const std::string &database, unsigned int port,
                  const pbmysql::ConnectionOptions &options);

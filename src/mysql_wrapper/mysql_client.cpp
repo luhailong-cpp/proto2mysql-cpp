@@ -8,6 +8,9 @@
 #include <vector>
 
 namespace {
+constexpr int kNoMoreResultSets = -1;
+constexpr std::size_t kInitialResultColumnBufferBytes = 256;
+
 [[noreturn]] void ThrowConnectionError(MYSQL *mysql) {
     throw MysqlError(mysql_errno(mysql), mysql_error(mysql), mysql_sqlstate(mysql));
 }
@@ -57,7 +60,7 @@ class RemainingStatementResults {
         mysql_stmt_free_result(statement_);
         for (;;) {
             const int result = mysql_stmt_next_result(statement_);
-            if (result == -1)
+            if (result == kNoMoreResultSets)
                 break;
             if (result != 0)
                 ThrowStatementError(statement_);
@@ -150,7 +153,7 @@ MysqlClient::MysqlResult MysqlClient::RealQuery(const std::string &query) {
         ThrowConnectionError(connection_);
     while (mysql_more_results(connection_)) {
         const int next = mysql_next_result(connection_);
-        if (next == -1)
+        if (next == kNoMoreResultSets)
             break;
         if (next != 0)
             ThrowConnectionError(connection_);
@@ -255,7 +258,8 @@ void MysqlClient::QueryResultRowProcessor(const pbmysql::Statement &statement,
         ThrowStatementError(stmt.get());
     const size_t count = mysql_num_fields(metadata.get());
     std::vector<MYSQL_BIND> columns(count);
-    std::vector<std::vector<char>> buffers(count, std::vector<char>(256));
+    std::vector<std::vector<char>> buffers(count,
+                                           std::vector<char>(kInitialResultColumnBufferBytes));
     std::vector<unsigned long> lengths(count);
     auto nulls = std::make_unique<BindBool[]>(count);
     auto errors = std::make_unique<BindBool[]>(count);

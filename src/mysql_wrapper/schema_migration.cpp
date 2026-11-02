@@ -1,18 +1,26 @@
 #include "src/mysql_wrapper/message_table.h"
 
+#include "src/mysql_wrapper/database_limits.h"
 #include "src/mysql_wrapper/identifier_utils.h"
+#include "src/mysql_wrapper/text_encoding.h"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
-#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
 
 namespace pbmysql {
 namespace {
 using Field = google::protobuf::FieldDescriptor;
+constexpr std::size_t kMediumIntegerIndexBytes =
+    3; // MySQL MEDIUMINT has a 24-bit index representation.
+constexpr std::string_view kFieldNumberCommentPrefix = "pb:";
+constexpr std::string_view kCaseInsensitiveCollationSuffix = "_ci";
+constexpr const char *kMySql8FreshMetadataSql =
+    "/*!80000 SET SESSION information_schema_stats_expiry = 0 */";
 std::string Lower(std::string s) {
     for (auto &c : s)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -44,15 +52,7 @@ std::string Join(const std::vector<std::string> &values, const std::string &deli
     }
     return result;
 }
-std::string HexLiteral(const std::string &text) {
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string out = "X'";
-    for (unsigned char c : text) {
-        out += digits[c >> 4];
-        out += digits[c & 15];
-    }
-    return out + "'";
-}
+std::string HexLiteral(const std::string &text) { return "X'" + HexEncode(text) + "'"; }
 std::string RowText(const MYSQL_ROW &row, const unsigned long *lengths, uint32_t size, uint32_t n) {
     if (!row || !lengths || n >= size || !row[n])
         return {};
@@ -111,48 +111,23 @@ size_t IndexBytes(const std::string &type, int prefix = 0) {
     const auto base = BaseType(type);
     const int length = prefix ? prefix : TypeLength(type);
     if (base == "varchar" || base == "char" || base.find("text") != std::string::npos)
-        return static_cast<size_t>(std::max(0, length)) * 4;
+        return static_cast<size_t>(std::max(0, length)) * kUtf8MaxBytesPerCodePoint;
     if (base == "varbinary" || base == "binary" || base.find("blob") != std::string::npos)
         return static_cast<size_t>(std::max(0, length));
     if (base == "tinyint")
-        return 1;
+        return sizeof(std::uint8_t);
     if (base == "smallint")
-        return 2;
+        return sizeof(std::uint16_t);
     if (base == "mediumint")
-        return 3;
+        return kMediumIntegerIndexBytes;
     if (base == "int" || base == "float")
-        return 4;
+        return sizeof(std::uint32_t);
     if (base == "bigint" || base == "double" || base == "datetime")
-        return 8;
+        return sizeof(std::uint64_t);
     return 0;
 }
 std::string SafeGeneratedName(const std::string &name) {
-    size_t count = 0, end = 0;
-    while (end < name.size()) {
-        if ((static_cast<unsigned char>(name[end]) & 0xc0) != 0x80)
-            ++count;
-        ++end;
-    }
-    if (count <= 64)
-        return name;
-    uint32_t hash = 2166136261u;
-    for (unsigned char c : name) {
-        hash ^= c;
-        hash *= 16777619u;
-    }
-    std::ostringstream suffix;
-    suffix << '_' << std::hex << std::setw(8) << std::setfill('0') << hash;
-    end = 0;
-    count = 0;
-    while (end < name.size()) {
-        if ((static_cast<unsigned char>(name[end]) & 0xc0) != 0x80) {
-            if (count == 55)
-                break;
-            ++count;
-        }
-        ++end;
-    }
-    return name.substr(0, end) + suffix.str();
+    return TruncateIdentifier(name, kMaxIdentifierLength);
 }
 std::string ColumnAttributes(const std::string &type) {
     size_t begin = std::string::npos;
@@ -262,14 +237,15 @@ std::string MessageTable::SelectTableMetadataSql() const {
 }
 bool MessageTable::OnSelectTableMetadata(const MYSQL_ROW &row, const unsigned long *lengths,
                                          uint32_t size) {
-    if (size < 3 || !row || !row[0] || !row[1] || table_metadata_known_)
+    enum Column : uint32_t { Engine, Collation, AutoIncrement, TableColumnCount };
+    if (size < TableColumnCount || !row || !row[Engine] || !row[Collation] || table_metadata_known_)
         throw SchemaError(SchemaErrorCode::IncompleteMetadata,
                           "incomplete or duplicate table metadata");
     table_metadata_known_ = true;
-    table_engine_ = RowText(row, lengths, size, 0);
-    table_collation_ = RowText(row, lengths, size, 1);
-    if (row[2])
-        online_auto_increment_ = Integer<uint64_t>(RowText(row, lengths, size, 2));
+    table_engine_ = RowText(row, lengths, size, Engine);
+    table_collation_ = RowText(row, lengths, size, Collation);
+    if (row[AutoIncrement])
+        online_auto_increment_ = Integer<uint64_t>(RowText(row, lengths, size, AutoIncrement));
     return true;
 }
 std::string MessageTable::SelectForeignKeysSql() const {
@@ -283,12 +259,15 @@ std::string MessageTable::SelectForeignKeysSql() const {
 }
 bool MessageTable::OnSelectForeignKey(const MYSQL_ROW &row, const unsigned long *lengths,
                                       uint32_t size) {
-    if (size < 4 || !row || !row[0] || !row[1] || !row[2] || !row[3])
+    enum Column : uint32_t { Schema, Name, OwnerTable, ReferencedTable, ForeignKeyColumnCount };
+    if (size < ForeignKeyColumnCount || !row || !row[Schema] || !row[Name] || !row[OwnerTable] ||
+        !row[ReferencedTable])
         throw SchemaError(SchemaErrorCode::IncompleteMetadata, "incomplete foreign-key metadata");
     dependencies_known_ = true;
-    foreign_keys_.push_back(RowText(row, lengths, size, 0) + "." + RowText(row, lengths, size, 1) +
-                            " (" + RowText(row, lengths, size, 2) + " -> " +
-                            RowText(row, lengths, size, 3) + ")");
+    foreign_keys_.push_back(RowText(row, lengths, size, Schema) + "." +
+                            RowText(row, lengths, size, Name) + " (" +
+                            RowText(row, lengths, size, OwnerTable) + " -> " +
+                            RowText(row, lengths, size, ReferencedTable) + ")");
     return true;
 }
 std::string MessageTable::SelectTriggersSql() const {
@@ -299,41 +278,54 @@ std::string MessageTable::SelectTriggersSql() const {
 }
 bool MessageTable::OnSelectTrigger(const MYSQL_ROW &row, const unsigned long *lengths,
                                    uint32_t size) {
-    if (size < 3 || !row || !row[0] || !row[1] || !row[2])
+    enum Column : uint32_t { Name, Timing, Event, TriggerColumnCount };
+    if (size < TriggerColumnCount || !row || !row[Name] || !row[Timing] || !row[Event])
         throw SchemaError(SchemaErrorCode::IncompleteMetadata, "incomplete trigger metadata");
     dependencies_known_ = true;
-    triggers_.push_back(RowText(row, lengths, size, 0) + " (" + RowText(row, lengths, size, 1) +
-                        " " + RowText(row, lengths, size, 2) + ")");
+    triggers_.push_back(RowText(row, lengths, size, Name) + " (" +
+                        RowText(row, lengths, size, Timing) + " " +
+                        RowText(row, lengths, size, Event) + ")");
     return true;
 }
 bool MessageTable::OnSelectColumn(const MYSQL_ROW &row, const unsigned long *lengths,
                                   uint32_t size) {
-    if (size < 2 || !row || !row[0] || !row[1] || !lengths)
+    enum Column : uint32_t {
+        Name,
+        Type,
+        Comment,
+        Nullable,
+        Default,
+        Extra,
+        Collation,
+        Charset,
+        ColumnCount
+    };
+    if (size <= Type || !row || !row[Name] || !row[Type] || !lengths)
         throw SchemaError(SchemaErrorCode::IncompleteMetadata, "incomplete column metadata");
     ColumnMeta meta;
-    meta.type = RowText(row, lengths, size, 1);
-    const auto comment = RowText(row, lengths, size, 2);
-    if (comment.rfind("pb:", 0) == 0) {
-        auto num = comment.substr(3);
+    meta.type = RowText(row, lengths, size, Type);
+    const auto comment = RowText(row, lengths, size, Comment);
+    if (comment.rfind(kFieldNumberCommentPrefix, 0) == 0) {
+        auto num = comment.substr(kFieldNumberCommentPrefix.size());
         if (!num.empty() && num.find_first_not_of("0123456789") == std::string::npos) {
             auto value = Integer<uint64_t>(num);
-            if (value > 0 && value <= 536870911)
+            if (value > 0 && value <= Field::kMaxNumber)
                 meta.field_num = static_cast<int>(value);
         }
     }
-    if (size >= 7) {
-        if (!row[3])
+    if (size >= Charset) {
+        if (!row[Nullable])
             throw SchemaError(SchemaErrorCode::IncompleteMetadata, "IS_NULLABLE metadata is NULL");
         meta.metadata_complete = true;
-        meta.nullable = Lower(RowText(row, lengths, size, 3)) == "yes";
-        if (row[4])
-            meta.default_value = RowText(row, lengths, size, 4);
-        meta.extra = Lower(RowText(row, lengths, size, 5));
-        meta.collation = RowText(row, lengths, size, 6);
-        meta.charset = size >= 8 ? RowText(row, lengths, size, 7)
-                                 : meta.collation.substr(0, meta.collation.find('_'));
+        meta.nullable = Lower(RowText(row, lengths, size, Nullable)) == "yes";
+        if (row[Default])
+            meta.default_value = RowText(row, lengths, size, Default);
+        meta.extra = Lower(RowText(row, lengths, size, Extra));
+        meta.collation = RowText(row, lengths, size, Collation);
+        meta.charset = size >= ColumnCount ? RowText(row, lengths, size, Charset)
+                                           : meta.collation.substr(0, meta.collation.find('_'));
     }
-    const auto name = RowText(row, lengths, size, 0);
+    const auto name = RowText(row, lengths, size, Name);
     if (!existing_columns_.emplace(name, std::move(meta)).second)
         throw SchemaError(SchemaErrorCode::SchemaDrift, "duplicate column metadata: " + name);
     return true;
@@ -346,13 +338,23 @@ std::string MessageTable::SelectIndexesSql() const {
 }
 bool MessageTable::OnSelectIndex(const MYSQL_ROW &row, const unsigned long *lengths,
                                  uint32_t size) {
+    enum Column : uint32_t {
+        Name,
+        NonUnique,
+        Sequence,
+        ColumnName,
+        Prefix,
+        Type,
+        Direction,
+        IndexColumnCount
+    };
     indexes_known_ = true;
-    if (size < 6 || !row || !lengths || !row[0] || !row[1] || !row[2])
+    if (size <= Type || !row || !lengths || !row[Name] || !row[NonUnique] || !row[Sequence])
         throw SchemaError(SchemaErrorCode::IncompleteMetadata, "incomplete index metadata");
-    const auto name = RowText(row, lengths, size, 0), key = NameKey(name);
+    const auto name = RowText(row, lengths, size, Name), key = NameKey(name);
     auto found = existing_indexes_.find(key);
-    bool unique = RowText(row, lengths, size, 1) == "0";
-    auto type = Lower(RowText(row, lengths, size, 5));
+    bool unique = RowText(row, lengths, size, NonUnique) == "0";
+    auto type = Lower(RowText(row, lengths, size, Type));
     if (found != existing_indexes_.end() &&
         (found->second.name != name || found->second.unique != unique ||
          found->second.type != type))
@@ -363,10 +365,11 @@ bool MessageTable::OnSelectIndex(const MYSQL_ROW &row, const unsigned long *leng
     index.unique = unique;
     index.type = type;
     IndexColumn column;
-    column.sequence = Integer<int>(RowText(row, lengths, size, 2));
-    column.name = RowText(row, lengths, size, 3);
-    column.prefix = row[4] ? Integer<int>(RowText(row, lengths, size, 4)) : 0;
-    column.descending = size >= 7 && Lower(RowText(row, lengths, size, 6)) == "d";
+    column.sequence = Integer<int>(RowText(row, lengths, size, Sequence));
+    column.name = RowText(row, lengths, size, ColumnName);
+    column.prefix = row[Prefix] ? Integer<int>(RowText(row, lengths, size, Prefix)) : 0;
+    column.descending =
+        size >= IndexColumnCount && Lower(RowText(row, lengths, size, Direction)) == "d";
     if (column.sequence < 1 || column.prefix < 0 ||
         std::any_of(
             index.columns.begin(), index.columns.end(),
@@ -436,7 +439,9 @@ std::string MessageTable::LegacyKeyReason(const ColumnMatch &column) const {
         return {};
     if (collation.empty())
         return "string key collation metadata is missing";
-    if (collation.size() >= 3 && collation.substr(collation.size() - 3) == "_ci")
+    if (collation.size() >= kCaseInsensitiveCollationSuffix.size() &&
+        collation.substr(collation.size() - kCaseInsensitiveCollationSuffix.size()) ==
+            kCaseInsensitiveCollationSuffix)
         return "case-insensitive key collation " + column.meta->collation;
     return "key collation " + column.meta->collation +
            " does not guarantee codepoint and trailing-space identity";
@@ -465,7 +470,7 @@ std::string MessageTable::IndexColumns(const StringVector &fields, bool prefix) 
         auto field = descriptor_->FindFieldByName(name);
         auto sql = QuoteIdentifier(name);
         if (prefix && NeedsPrefix(ColumnType(field)))
-            sql += "(191)";
+            sql += "(" + std::to_string(kDefaultKeyLength) + ")";
         columns.push_back(sql);
     }
     return Join(columns);
@@ -577,12 +582,14 @@ StringVector MessageTable::BuildIndexAlterClauses() const {
             auto *field = descriptor_->FindFieldByName(field_name);
             auto match = std::find_if(matches.begin(), matches.end(),
                                       [&](const auto &column) { return column.field == field; });
-            total +=
-                IndexBytes(AlignedColumnType(*match), NeedsPrefix(ColumnType(field)) ? 191 : 0);
+            total += IndexBytes(AlignedColumnType(*match), NeedsPrefix(ColumnType(field))
+                                                               ? static_cast<int>(kDefaultKeyLength)
+                                                               : 0);
         }
-        if (total > 3072)
-            throw SchemaError(SchemaErrorCode::SchemaDrift,
-                              "preserved online widths exceed 3072-byte index budget: " + name);
+        if (total > kMaxIndexBytes)
+            throw SchemaError(SchemaErrorCode::SchemaDrift, "preserved online widths exceed " +
+                                                                std::to_string(kMaxIndexBytes) +
+                                                                "-byte index budget: " + name);
         if (found == existing_indexes_.end()) {
             if (!primary)
                 clauses.push_back(std::string("ADD ") + (unique ? "UNIQUE KEY " : "KEY ") +
@@ -600,7 +607,7 @@ StringVector MessageTable::BuildIndexAlterClauses() const {
             if (map != renamed.end())
                 actual = map->second;
             auto field = descriptor_->FindFieldByName(fields[i]);
-            int prefix = NeedsPrefix(ColumnType(field)) ? 191 : 0;
+            int prefix = NeedsPrefix(ColumnType(field)) ? static_cast<int>(kDefaultKeyLength) : 0;
             if (columns[i].sequence != static_cast<int>(i + 1) ||
                 NameKey(actual) != NameKey(fields[i]) || columns[i].prefix != prefix ||
                 columns[i].descending)
@@ -782,7 +789,9 @@ MigrationReport MessageTable::LegacyMigrationReport() const {
         size_t total = 0;
         for (const auto &name : fields) {
             auto *field = descriptor_->FindFieldByName(name);
-            total += IndexBytes(types.at(name), NeedsPrefix(ColumnType(field)) ? 191 : 0);
+            total += IndexBytes(types.at(name), NeedsPrefix(ColumnType(field))
+                                                    ? static_cast<int>(kDefaultKeyLength)
+                                                    : 0);
         }
         return total;
     };
@@ -796,7 +805,7 @@ MigrationReport MessageTable::LegacyMigrationReport() const {
     std::set<std::string> shrunk;
     for (const auto &key : keys)
         for (const auto &name : key) {
-            if (budget(key) <= 3072)
+            if (budget(key) <= kMaxIndexBytes)
                 break;
             auto *field = descriptor_->FindFieldByName(name);
             if (identity_columns_.count(name) && types[name] != ColumnType(field)) {
@@ -806,8 +815,9 @@ MigrationReport MessageTable::LegacyMigrationReport() const {
         }
     for (const auto &name : shrunk) {
         report.warnings.push_back("Online key width is reduced to the proto declaration to satisfy "
-                                  "the 3072-byte index budget: " +
-                                  name + " " + types[name]);
+                                  "the " +
+                                  std::to_string(kMaxIndexBytes) + "-byte index budget: " + name +
+                                  " " + types[name]);
         for (const auto &column : matches)
             if (std::string(column.field->name()) == name && column.meta &&
                 !legacy_names.count(name))
@@ -872,7 +882,7 @@ MigrationReport MessageTable::LegacyMigrationReport() const {
             if (legacy_names.count(name))
                 prefix = 0;
             else if (!prefix && NeedsPrefix(types[name]))
-                prefix = 191;
+                prefix = static_cast<int>(kDefaultKeyLength);
             if (prefix && TypeLength(types[name]) > 0 && prefix >= TypeLength(types[name]) &&
                 !NeedsPrefix(types[name]))
                 prefix = 0;
@@ -884,8 +894,9 @@ MigrationReport MessageTable::LegacyMigrationReport() const {
             parts.push_back(sql);
             total += IndexBytes(types[name], prefix);
         }
-        if (total > 3072)
-            reason = "preserved definition exceeds 3072-byte index budget";
+        if (total > kMaxIndexBytes)
+            reason = "preserved definition exceeds " + std::to_string(kMaxIndexBytes) +
+                     "-byte index budget";
         if (!reason.empty()) {
             report.warnings.push_back("Cannot automatically reproduce extra index " + index.name +
                                       ": " + reason + "; recreate it manually before RENAME");
@@ -907,7 +918,7 @@ MigrationReport MessageTable::LegacyMigrationReport() const {
     report.statements.push_back("INSERT INTO " + qualified(shadow_name) + " (" + Join(targets) +
                                 ") SELECT " + Join(sources) + " FROM " + qualified(table_name_));
     if (!auto_increment_key_.empty()) {
-        report.statements.push_back("/*!80000 SET SESSION information_schema_stats_expiry = 0 */");
+        report.statements.push_back(kMySql8FreshMetadataSql);
         report.statements.push_back(
             "SET @p2m_auto_increment = COALESCE((SELECT AUTO_INCREMENT FROM "
             "INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=" +

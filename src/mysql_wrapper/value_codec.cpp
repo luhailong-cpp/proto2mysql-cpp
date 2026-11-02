@@ -1,6 +1,9 @@
 #include "src/mysql_wrapper/value_codec.h"
+#include "src/mysql_wrapper/database_limits.h"
 
+#include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -11,12 +14,46 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 
 namespace pbmysql {
 namespace {
 using google::protobuf::FieldDescriptor;
 using google::protobuf::Message;
+using google::protobuf::util::TimeUtil;
+constexpr std::string_view kSqlDateShape = "YYYY-MM-DD";
+constexpr std::string_view kSqlDateTimeSecondsShape = "YYYY-MM-DD HH:MM:SS";
+constexpr std::string_view kSqlMicrosecondSuffix = ".000000";
+static_assert(kSqlMicrosecondSuffix.size() - 1 == kTimestampFractionalDigits,
+              "SQL formatter must match the shared DATETIME precision");
+constexpr std::string_view kRfc3339MidnightSuffix = "T00:00:00Z";
+constexpr std::string_view kMySqlMinDateTime = "1000-01-01T00:00:00Z";
+constexpr auto kNanosecondsPerMicrosecond =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds{1}).count();
+constexpr auto kNanosecondsPerSecond =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds{1}).count();
+int64_t MySqlMinDateTimeSeconds() {
+    static const auto seconds = [] {
+        google::protobuf::Timestamp minimum;
+        if (!TimeUtil::FromString(kMySqlMinDateTime.data(), &minimum))
+            throw std::logic_error("invalid MySQL DATETIME lower bound");
+        return minimum.seconds();
+    }();
+    return seconds;
+}
+template <class Float> std::string FormatFloating(Float value) {
+    // General notation needs significant digits, an integer exponent and the
+    // mantissa sign/decimal point/exponent marker/exponent sign decorations.
+    constexpr std::string_view decorations = "-.e+";
+    constexpr auto capacity = std::numeric_limits<Float>::max_digits10 +
+                              std::numeric_limits<int>::digits10 + decorations.size();
+    std::array<char, capacity> buffer{};
+    const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+    if (result.ec != std::errc{})
+        throw std::invalid_argument("cannot format floating-point value");
+    return std::string(buffer.data(), result.ptr);
+}
 void ValidateField(const Message &message, const FieldDescriptor *field) {
     if (!field || field->containing_type() != message.GetDescriptor())
         throw std::invalid_argument("field does not belong to message");
@@ -142,11 +179,7 @@ std::string ValueText(const SqlValue &value) {
             else if constexpr (std::is_same_v<T, double>) {
                 if (!std::isfinite(v))
                     throw std::invalid_argument("non-finite floating-point value");
-                char text[128];
-                const auto result = std::to_chars(text, text + sizeof(text), v);
-                if (result.ec != std::errc{})
-                    throw std::invalid_argument("cannot format floating-point value");
-                return std::string(text, result.ptr);
+                return FormatFloating(v);
             } else
                 return std::to_string(v);
         },
@@ -176,20 +209,23 @@ SqlValue FieldValue(const Message &message, const FieldDescriptor *field) {
         const auto *r = stamp.GetReflection();
         const auto seconds = r->GetInt64(stamp, d->FindFieldByName("seconds"));
         const auto nanos = r->GetInt32(stamp, d->FindFieldByName("nanos"));
-        if (seconds == -62135596800LL && nanos == 0)
+        if (seconds == TimeUtil::kTimestampMinSeconds && nanos == 0)
             return nullptr;
-        if (seconds < -30610224000LL || seconds > 253402300799LL || nanos < 0 || nanos > 999999999)
+        if (seconds < MySqlMinDateTimeSeconds() || seconds > TimeUtil::kTimestampMaxSeconds ||
+            nanos < 0 || nanos >= kNanosecondsPerSecond)
             throw std::invalid_argument("Timestamp is outside MySQL DATETIME range");
         google::protobuf::Timestamp ts;
         ts.set_seconds(seconds);
-        ts.set_nanos(nanos / 1000 * 1000);
-        std::string text = google::protobuf::util::TimeUtil::ToString(ts);
-        text[10] = ' ';
+        ts.set_nanos(
+            static_cast<int32_t>(nanos / kNanosecondsPerMicrosecond * kNanosecondsPerMicrosecond));
+        std::string text = TimeUtil::ToString(ts);
+        text[kSqlDateShape.size()] = ' ';
         text.pop_back();
-        if (text.size() == 19)
-            text += ".000000";
+        if (text.size() == kSqlDateTimeSecondsShape.size())
+            text.append(kSqlMicrosecondSuffix.data(), kSqlMicrosecondSuffix.size());
         else
-            text.append(26 - text.size(), '0');
+            text.append(
+                kSqlDateTimeSecondsShape.size() + kSqlMicrosecondSuffix.size() - text.size(), '0');
         return text;
     }
     switch (field->type()) {
@@ -211,9 +247,7 @@ SqlValue FieldValue(const Message &message, const FieldDescriptor *field) {
             throw std::invalid_argument("non-finite float field: " + std::string(field->name()));
         // A FLOAT parameter must preserve the shortest float32 decimal value,
         // rather than introducing the binary64 expansion of that float32.
-        char text[64];
-        const auto formatted = std::to_chars(text, text + sizeof(text), value);
-        return std::string(text, formatted.ptr);
+        return FormatFloating(value);
     }
     case FieldDescriptor::TYPE_DOUBLE: {
         const auto value = reflection->GetDouble(message, field);
@@ -327,14 +361,15 @@ void ParseRow(Message &message, const std::vector<SqlValue> &row) {
             reflection->SwapFields(parsed.get(), holder.get(), {field});
         } else if (IsTimestamp(field)) {
             std::string iso = text;
-            if (iso.size() == 10)
-                iso += "T00:00:00Z";
-            else if (iso.size() >= 19 && iso[10] == ' ') {
-                iso[10] = 'T';
+            if (iso.size() == kSqlDateShape.size())
+                iso.append(kRfc3339MidnightSuffix.data(), kRfc3339MidnightSuffix.size());
+            else if (iso.size() >= kSqlDateTimeSecondsShape.size() &&
+                     iso[kSqlDateShape.size()] == ' ') {
+                iso[kSqlDateShape.size()] = 'T';
                 iso += 'Z';
             }
             google::protobuf::Timestamp ts;
-            if (!google::protobuf::util::TimeUtil::FromString(iso, &ts))
+            if (!TimeUtil::FromString(iso, &ts))
                 throw std::invalid_argument("invalid DATETIME value");
             auto *target = reflection->MutableMessage(parsed.get(), field);
             const auto *target_desc = target->GetDescriptor();

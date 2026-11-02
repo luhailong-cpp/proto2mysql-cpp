@@ -13,6 +13,7 @@
 PBMYSQL_REGISTER_PROTO_FILE(pbmysql::test::RuntimeRow)
 
 namespace {
+inline constexpr int kNewSchemaColumnNumber = 100;
 using namespace pbmysql;
 using Row = pbmysql::test::RuntimeRow;
 TEST(DescriptorRegistry, ScansGeneratedRootsAndDependenciesWithoutPerTableCalls) {
@@ -35,7 +36,7 @@ TEST(DescriptorRegistry, InputSchemaWinsOverLinkedSchemaAndDatabaseOwnsItsLifeti
         Row::descriptor()->file()->CopyTo(files.add_file());
         auto *added = files.mutable_file(0)->mutable_message_type(0)->add_field();
         added->set_name("new_column");
-        added->set_number(100);
+        added->set_number(kNewSchemaColumnNumber);
         added->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
         added->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
         auto source = std::make_shared<DescriptorSet>(files);
@@ -109,7 +110,9 @@ TEST(SchemaExport, SortsPhysicalTableNamesAndPreservesOutputOnFailure) {
     db.WriteCreateTableSql(output);
     EXPECT_LT(output.str().find("`a_table`"), output.str().find("`z_table`"));
     const auto destination =
-        std::filesystem::temp_directory_path() / ("pbmysql-export-failure-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".sql");
+        std::filesystem::temp_directory_path() /
+        ("pbmysql-export-failure-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".sql");
     {
         std::ofstream file(destination);
         file << "previous schema";
@@ -167,7 +170,7 @@ TEST(DescriptorRegistry, EmptyTableNamesAreSkippedAndDynamicRootsCannotDangleInG
 }
 TEST(SchemaExport, Utf8DescriptorAndOutputPathsWorkWithNativeFilesystemEncoding) {
     auto directory = std::filesystem::temp_directory_path() /
-                           std::filesystem::u8path("pbmysql-\xe8\xb7\xaf\xe5\xbe\x84-test");
+                     std::filesystem::u8path("pbmysql-\xe8\xb7\xaf\xe5\xbe\x84-test");
     directory += std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     std::filesystem::create_directories(directory);
     const auto input = directory / std::filesystem::u8path("\xe6\x8f\x8f\xe8\xbf\xb0.pb");

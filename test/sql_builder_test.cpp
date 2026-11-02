@@ -1,4 +1,5 @@
 #include "proto2mysql_option.pb.h"
+#include "src/mysql_wrapper/database_limits.h"
 #include "src/mysql_wrapper/sql_builder.h"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
@@ -231,7 +232,7 @@ TEST_F(BuilderFixture, InvalidBatchesAreRejectedBeforeReturningSQL) {
     SQLBuilder builder(*row);
     EXPECT_THROW(builder.BatchInsert({}), std::invalid_argument);
     EXPECT_THROW(builder.BatchInsert({row.get(), nullptr}), std::invalid_argument);
-    EXPECT_THROW(builder.BatchInsert(std::vector<const Message *>(1001, row.get())),
+    EXPECT_THROW(builder.BatchInsert(std::vector<const Message *>(kBatchSize + 1, row.get())),
                  std::invalid_argument);
     google::protobuf::Timestamp different;
     EXPECT_THROW(builder.Insert(different), std::invalid_argument);

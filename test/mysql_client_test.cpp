@@ -125,7 +125,7 @@ int main(int argc, char** argv)
     query_database_param.set_db_host("127.0.0.1");
     query_database_param.set_db_user("root");
     query_database_param.set_db_password("lhl616586");
-    query_database_param.set_db_port(3306);
+    query_database_param.set_db_port(MYSQL_PORT);
     query_database_param.set_db_dbname("game");
 
     query_database = std::make_shared<Database>();

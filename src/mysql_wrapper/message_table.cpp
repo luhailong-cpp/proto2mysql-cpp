@@ -2,17 +2,18 @@
 
 #include <algorithm>
 #include <cctype>
-#include <iomanip>
 #include <limits>
 #include <set>
-#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 
 #include "db_base.pb.h"
 #include "proto2mysql_option.pb.h"
+#include "src/mysql_wrapper/database_limits.h"
 #include "src/mysql_wrapper/identifier_utils.h"
 #include "src/mysql_wrapper/sql_builder.h"
+#include "src/mysql_wrapper/text_encoding.h"
 #include "src/mysql_wrapper/value_codec.h"
 
 namespace pbmysql {
@@ -36,6 +37,15 @@ MessageTable &MessageTable::operator=(MessageTable &&other) {
 namespace {
 using Field = ::google::protobuf::FieldDescriptor;
 using Message = ::google::protobuf::Message;
+constexpr std::string_view kZeroDefaultClause = " DEFAULT 0";
+constexpr std::string_view kNotNullClause = " NOT NULL";
+constexpr std::string_view kInsertKeyword = "INSERT";
+constexpr std::string_view kValuesPrefix = "VALUES ";
+constexpr std::string_view kValuesTuplePrefix = "VALUES (";
+constexpr std::size_t kWideScalarIndexBytes = sizeof(std::uint64_t);
+constexpr std::size_t kNarrowScalarIndexBytes = sizeof(std::uint32_t);
+// mysql_real_escape_string can produce two output bytes per input byte.
+constexpr std::size_t kMaximumEscapeExpansion = 2;
 std::optional<std::string> ReadTextOption(const Message &options, int number) {
     std::vector<const Field *> fields;
     auto *reflection = options.GetReflection();
@@ -141,14 +151,8 @@ bool Numeric(const Field *f) {
             f->cpp_type() == Field::CPPTYPE_DOUBLE);
 }
 std::string StringLiteral(const std::string &text) {
-    // Hex literals are independent of NO_BACKSLASH_ESCAPES and connection state.
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string s = "X'";
-    for (unsigned char c : text) {
-        s += digits[c >> 4];
-        s += digits[c & 15];
-    }
-    return s + "'";
+    // Hex literals do not depend on NO_BACKSLASH_ESCAPES or connection state.
+    return "X'" + HexEncode(text) + "'";
 }
 std::string Literal(const SqlValue &v) {
     if (std::holds_alternative<std::nullptr_t>(v))
@@ -169,41 +173,6 @@ std::string EscapeCache(const std::string &s) {
             out += c;
     }
     return out;
-}
-std::size_t Utf8Length(const std::string &value) {
-    std::size_t count = 0;
-    for (std::size_t i = 0; i < value.size(); ++count) {
-        auto c = static_cast<unsigned char>(value[i]);
-        unsigned n = 0;
-        uint32_t cp = 0;
-        if (c < 0x80) {
-            n = 1;
-            cp = c;
-        } else if (c >= 0xc2 && c <= 0xdf) {
-            n = 2;
-            cp = c & 31;
-        } else if (c >= 0xe0 && c <= 0xef) {
-            n = 3;
-            cp = c & 15;
-        } else if (c >= 0xf0 && c <= 0xf4) {
-            n = 4;
-            cp = c & 7;
-        } else
-            throw std::invalid_argument("invalid UTF-8 key value");
-        if (i + n > value.size())
-            throw std::invalid_argument("invalid UTF-8 key value");
-        for (unsigned k = 1; k < n; ++k) {
-            auto d = static_cast<unsigned char>(value[i + k]);
-            if ((d & 0xc0) != 0x80)
-                throw std::invalid_argument("invalid UTF-8 key value");
-            cp = (cp << 6) | (d & 63);
-        }
-        if ((n == 2 && cp < 128) || (n == 3 && cp < 2048) || (n == 4 && cp < 65536) ||
-            cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
-            throw std::invalid_argument("invalid UTF-8 key value");
-        i += n;
-    }
-    return count;
 }
 struct TypeInfo {
     std::string base;
@@ -233,76 +202,80 @@ TypeInfo ParseType(const std::string &s) {
     }
     return info;
 }
-int IntRank(const std::string &s) {
-    if (s == "tinyint")
-        return 1;
-    if (s == "smallint")
-        return 2;
-    if (s == "mediumint")
-        return 3;
-    if (s == "int")
-        return 4;
-    if (s == "bigint")
-        return 5;
-    return 0;
+enum class IntegerCapacity { NotInteger, TinyInt, SmallInt, MediumInt, Int, BigInt };
+IntegerCapacity IntegerRank(const std::string &type) {
+    if (type == "tinyint")
+        return IntegerCapacity::TinyInt;
+    if (type == "smallint")
+        return IntegerCapacity::SmallInt;
+    if (type == "mediumint")
+        return IntegerCapacity::MediumInt;
+    if (type == "int")
+        return IntegerCapacity::Int;
+    if (type == "bigint")
+        return IntegerCapacity::BigInt;
+    return IntegerCapacity::NotInteger;
 }
-int StringTypeRank(const std::string &type, bool binary) {
-    const StringVector family =
-        binary ? StringVector{"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob"}
-               : StringVector{"char", "varchar", "tinytext", "text", "mediumtext", "longtext"};
-    auto found = std::find(family.begin(), family.end(), type);
-    return found == family.end() ? 0 : static_cast<int>(found - family.begin()) + 1;
+enum class StringCapacity { NotString, Fixed, Variable, TinyLob, Lob, MediumLob, LongLob };
+StringCapacity StringRank(const std::string &type, bool binary) {
+    if (type == (binary ? "binary" : "char"))
+        return StringCapacity::Fixed;
+    if (type == (binary ? "varbinary" : "varchar"))
+        return StringCapacity::Variable;
+    if (type == (binary ? "tinyblob" : "tinytext"))
+        return StringCapacity::TinyLob;
+    if (type == (binary ? "blob" : "text"))
+        return StringCapacity::Lob;
+    if (type == (binary ? "mediumblob" : "mediumtext"))
+        return StringCapacity::MediumLob;
+    if (type == (binary ? "longblob" : "longtext"))
+        return StringCapacity::LongLob;
+    return StringCapacity::NotString;
 }
-// Returns -1 when unsafe, 0 when existing is sufficient, 1 for safe expansion.
-int Conversion(const std::string &live, const std::string &target) {
-    const auto a = ParseType(live), b = ParseType(target);
-    int ar = IntRank(a.base), br = IntRank(b.base);
-    if (ar || br) {
-        if (!ar || !br || a.unsigned_ != b.unsigned_)
-            return -1;
-        return br > ar ? 1 : 0;
+enum class TypeConversion { Unsafe, ExistingCapacitySufficient, SafeExpansion };
+TypeConversion Conversion(const std::string &live, const std::string &target) {
+    const auto current = ParseType(live), desired = ParseType(target);
+    const auto current_integer = IntegerRank(current.base),
+               desired_integer = IntegerRank(desired.base);
+    if (current_integer != IntegerCapacity::NotInteger ||
+        desired_integer != IntegerCapacity::NotInteger) {
+        if (current_integer == IntegerCapacity::NotInteger ||
+            desired_integer == IntegerCapacity::NotInteger ||
+            current.unsigned_ != desired.unsigned_)
+            return TypeConversion::Unsafe;
+        return desired_integer > current_integer ? TypeConversion::SafeExpansion
+                                                 : TypeConversion::ExistingCapacitySufficient;
     }
-    if (a.base == b.base) {
-        if (a.base == "varchar" || a.base == "varbinary" || a.base == "char" ||
-            a.base == "binary" || a.base == "datetime")
-            return b.length > a.length ? 1 : 0;
-        return 0;
+    if (current.base == desired.base) {
+        if (current.base == "varchar" || current.base == "varbinary" || current.base == "char" ||
+            current.base == "binary" || current.base == "datetime")
+            return desired.length > current.length ? TypeConversion::SafeExpansion
+                                                   : TypeConversion::ExistingCapacitySufficient;
+        return TypeConversion::ExistingCapacitySufficient;
     }
-    if (a.base == "float" && b.base == "double")
-        return 1;
-    if (a.base == "double" && b.base == "float")
-        return 0;
+    if (current.base == "float" && desired.base == "double")
+        return TypeConversion::SafeExpansion;
+    if (current.base == "double" && desired.base == "float")
+        return TypeConversion::ExistingCapacitySufficient;
     for (bool binary : {false, true}) {
-        const int arank = StringTypeRank(a.base, binary), brank = StringTypeRank(b.base, binary);
-        if (arank && brank)
-            return brank > arank ? 1 : 0;
+        const auto current_string = StringRank(current.base, binary),
+                   desired_string = StringRank(desired.base, binary);
+        if (current_string != StringCapacity::NotString &&
+            desired_string != StringCapacity::NotString)
+            return desired_string > current_string ? TypeConversion::SafeExpansion
+                                                   : TypeConversion::ExistingCapacitySufficient;
     }
-    return -1;
+    return TypeConversion::Unsafe;
 }
 std::string IndexName(const std::string &prefix, const std::string &table,
                       const std::string &suffix = "") {
-    auto name = prefix + table + suffix;
-    if (Utf8Length(name) <= 64)
-        return name;
-    uint32_t hash = 2166136261u;
-    for (unsigned char c : name) {
-        hash ^= c;
-        hash *= 16777619u;
-    }
-    std::ostringstream hex;
-    hex << '_' << std::hex << std::setw(8) << std::setfill('0') << hash;
-    std::size_t end = 0;
-    for (int i = 0; i < 55; ++i) {
-        ++end;
-        while (end < name.size() && (static_cast<unsigned char>(name[end]) & 0xc0) == 0x80)
-            ++end;
-    }
-    return name.substr(0, end) + hex.str();
+    return TruncateIdentifier(prefix + table + suffix, kMaxIdentifierLength);
 }
 } // namespace
 
 std::string QuoteIdentifier(const std::string &name) {
-    if (name.empty() || Utf8Length(name) > 64 || name.find('\0') != std::string::npos)
+    if (name.empty() || Utf8CodePointCount(name) > kMaxIdentifierLength ||
+        name.find('\0') != std::string::npos)
         throw std::invalid_argument("invalid MySQL identifier");
     std::string out = "`";
     for (char c : name) {
@@ -315,9 +288,9 @@ std::string QuoteIdentifier(const std::string &name) {
 void EscapeString(std::string &value, MYSQL *mysql) {
     if (!mysql)
         throw std::invalid_argument("EscapeString requires a connected MySQL handle");
-    if (value.size() > std::numeric_limits<unsigned long>::max() / 2)
+    if (value.size() > std::numeric_limits<unsigned long>::max() / kMaximumEscapeExpansion)
         throw std::length_error("SQL value is too large");
-    std::string out(value.size() * 2 + 1, '\0');
+    std::string out(value.size() * kMaximumEscapeExpansion + 1, '\0');
     auto n = mysql_real_escape_string(mysql, out.data(), value.data(),
                                       static_cast<unsigned long>(value.size()));
     out.resize(n);
@@ -343,7 +316,7 @@ std::string GetMysqlFieldType(const Field *f, const std::string &auto_key) {
     if (f->is_repeated())
         return "MEDIUMBLOB";
     if (IsTimestamp(f))
-        return "DATETIME(6)";
+        return "DATETIME(" + std::to_string(kTimestampFractionalDigits) + ")";
     std::string type;
     switch (f->cpp_type()) {
     case Field::CPPTYPE_INT32:
@@ -375,15 +348,15 @@ std::string GetMysqlFieldType(const Field *f, const std::string &auto_key) {
         type = "MEDIUMBLOB";
     }
     if (std::string(f->name()) == auto_key) {
-        auto pos = type.find(" DEFAULT 0");
+        auto pos = type.find(kZeroDefaultClause);
         if (pos != std::string::npos)
-            type.erase(pos, 10);
+            type.erase(pos, kZeroDefaultClause.size());
         type += " AUTO_INCREMENT";
     }
     return type;
 }
 bool IsTypeMatch(const std::string &live, const std::string &target) {
-    return Conversion(live, target) == 0;
+    return Conversion(live, target) == TypeConversion::ExistingCapacitySufficient;
 }
 
 MessageTable::MessageTable(const Message &source, const TableOptions &o)
@@ -428,7 +401,7 @@ MessageTable::MessageTable(const Message &source, const TableOptions &o)
     // Preserve the historic first-column default for legacy declarations only.
     if (primary_key_.empty() && !ReadTextOption(options_, proto2mysql::kTableNameFieldNumber) &&
         descriptor_->field_count())
-        primary_key_.push_back(std::string(descriptor_->field(0)->name()));
+        primary_key_.push_back(std::string(descriptor_->field(kDefaultPrimaryKeyIndex)->name()));
     if (o.table_name)
         table_name_ = *o.table_name;
     if (o.primary_keys)
@@ -519,7 +492,10 @@ void MessageTable::ValidateOptions() {
     for (const auto &pair : max_lengths_) {
         auto *f = field(pair.first);
         if (!identity_columns_.count(pair.first) || f->cpp_type() != Field::CPPTYPE_STRING ||
-            pair.second == 0 || pair.second > (f->type() == Field::TYPE_BYTES ? 3072u : 768u))
+            pair.second == 0 ||
+            pair.second > (f->type() == Field::TYPE_BYTES
+                               ? kMaxIndexBytes
+                               : kMaxIndexBytes / kUtf8MaxBytesPerCodePoint))
             throw std::invalid_argument(
                 "max_length must describe a string/bytes key within the InnoDB limit: " +
                 pair.first);
@@ -546,24 +522,26 @@ void MessageTable::ValidateOptions() {
             if (!seen.insert(n).second)
                 throw std::invalid_argument("duplicate index column: " + n);
             if (IsTimestamp(f))
-                total += 8;
+                total += kWideScalarIndexBytes;
             else if (f->is_repeated() || f->cpp_type() == Field::CPPTYPE_MESSAGE)
-                total += 191;
+                total += kDefaultKeyLength;
             else if (f->cpp_type() == Field::CPPTYPE_STRING) {
-                auto max = max_lengths_.count(n) ? max_lengths_.at(n) : 191;
-                total += (identity_columns_.count(n) ? max : 191) *
-                         (f->type() == Field::TYPE_BYTES ? 1 : 4);
+                auto max = max_lengths_.count(n) ? max_lengths_.at(n) : kDefaultKeyLength;
+                total += (identity_columns_.count(n) ? max : kDefaultKeyLength) *
+                         (f->type() == Field::TYPE_BYTES ? sizeof(std::uint8_t)
+                                                         : kUtf8MaxBytesPerCodePoint);
             } else if (f->cpp_type() == Field::CPPTYPE_BOOL)
                 ++total;
             else if (f->cpp_type() == Field::CPPTYPE_INT64 ||
                      f->cpp_type() == Field::CPPTYPE_UINT64 ||
                      f->cpp_type() == Field::CPPTYPE_DOUBLE)
-                total += 8;
+                total += kWideScalarIndexBytes;
             else
-                total += 4;
+                total += kNarrowScalarIndexBytes;
         }
-        if (total > 3072)
-            throw std::invalid_argument("index exceeds InnoDB 3072-byte limit");
+        if (total > kMaxIndexBytes)
+            throw std::invalid_argument("index exceeds InnoDB " + std::to_string(kMaxIndexBytes) +
+                                        "-byte limit");
     };
     budget(primary_key_);
     if (!unique_keys_.empty())
@@ -572,8 +550,9 @@ void MessageTable::ValidateOptions() {
         idx = Trim(idx);
         budget(Split(idx, ','));
     }
-    if (tidb_shard_row_id_bits_ > 15)
-        throw std::invalid_argument("tidb_shard_row_id_bits exceeds 15");
+    if (tidb_shard_row_id_bits_ > kMaxTiDBShardRowIDBits)
+        throw std::invalid_argument("tidb_shard_row_id_bits exceeds " +
+                                    std::to_string(kMaxTiDBShardRowIDBits));
     if (!primary_key_.empty() && !tidb_nonclustered_pk_)
         tidb_shard_row_id_bits_ = 0;
     tidb_pre_split_regions_ = std::min(tidb_pre_split_regions_, tidb_shard_row_id_bits_);
@@ -585,10 +564,10 @@ void MessageTable::ValidateFieldValue(const Message &m, const Field *f) const {
     if (!identity_columns_.count(name))
         return;
     const auto value = m.GetReflection()->GetString(m, f);
-    const auto max = max_lengths_.count(name) ? max_lengths_.at(name) : 191;
+    const auto max = max_lengths_.count(name) ? max_lengths_.at(name) : kDefaultKeyLength;
     std::size_t length;
     try {
-        length = f->type() == Field::TYPE_BYTES ? value.size() : Utf8Length(value);
+        length = f->type() == Field::TYPE_BYTES ? value.size() : Utf8CodePointCount(value);
     } catch (const std::invalid_argument &) {
         throw SchemaValidationError(SchemaErrorCode::InvalidKeyValue,
                                     "invalid UTF-8 key value: " + name);
@@ -615,7 +594,7 @@ std::string MessageTable::ColumnType(const Field *f) const {
     if (identity_columns_.count(std::string(f->name()))) {
         auto n = max_lengths_.count(std::string(f->name()))
                      ? max_lengths_.at(std::string(f->name()))
-                     : 191;
+                     : kDefaultKeyLength;
         return f->type() == Field::TYPE_BYTES
                    ? "VARBINARY(" + std::to_string(n) + ") NOT NULL DEFAULT ''"
                    : "VARCHAR(" + std::to_string(n) +
@@ -623,9 +602,9 @@ std::string MessageTable::ColumnType(const Field *f) const {
     }
     auto type = GetMysqlFieldType(f, auto_increment_key_);
     if (Contains(nullable_fields_, std::string(f->name()))) {
-        auto p = type.find(" NOT NULL");
+        auto p = type.find(kNotNullClause);
         if (p != std::string::npos)
-            type.erase(p, 9);
+            type.erase(p, kNotNullClause.size());
     }
     return type;
 }
@@ -651,7 +630,7 @@ std::string MessageTable::CreateTableSql() const {
                 (f->is_repeated() || f->cpp_type() == Field::CPPTYPE_MESSAGE ||
                  f->cpp_type() == Field::CPPTYPE_STRING) &&
                 !IsTimestamp(f))
-                col += "(191)";
+                col += "(" + std::to_string(kDefaultKeyLength) + ")";
             list.push_back(col);
         }
         return Join(list, ", ");
@@ -729,7 +708,7 @@ std::string MessageTable::InsertOnDupKeyForPrimaryKeySql(const Message &m, MYSQL
 }
 std::string MessageTable::ReplaceSql(const Message &m, MYSQL *c) const {
     auto s = InsertSql(m, c);
-    s.replace(0, 6, "REPLACE");
+    s.replace(0, kInsertKeyword.size(), "REPLACE");
     return s;
 }
 std::string MessageTable::BatchInsertSql(const std::vector<const Message *> &messages,
@@ -741,7 +720,7 @@ std::string MessageTable::BatchInsertSql(const std::vector<const Message *> &mes
         if (!m)
             throw std::invalid_argument("null message in batch");
         auto s = InsertSql(*m, c);
-        rows.push_back(s.substr(s.find("VALUES (") + 7));
+        rows.push_back(s.substr(s.find(kValuesTuplePrefix) + kValuesPrefix.size()));
     }
     return "INSERT INTO " + QuoteIdentifier(table_name_) + " (" + ColumnListCsv() + ") VALUES " +
            Join(rows, ", ");
@@ -916,7 +895,7 @@ std::string MessageTable::SelectAllWithOptionsSql(const std::string &where,
     if (opts.limit > 0)
         sql += " LIMIT " + std::to_string(opts.limit);
     else if (opts.offset > 0)
-        sql += " LIMIT 18446744073709551615";
+        sql += " LIMIT " + std::to_string(std::numeric_limits<uint64_t>::max());
     if (opts.offset > 0)
         sql += " OFFSET " + std::to_string(opts.offset);
     if (opts.for_update)

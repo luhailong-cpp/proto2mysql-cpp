@@ -1,18 +1,29 @@
 #include "runtime_test.pb.h"
 #include "src/mysql_wrapper/database.h"
+#include "src/mysql_wrapper/database_limits.h"
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <future>
 #include <gtest/gtest.h>
+#include <limits>
+#include <mysqld_error.h>
 #include <thread>
 
 namespace {
 using namespace pbmysql;
 using Row = pbmysql::test::RuntimeRow;
+using namespace std::string_literals;
+constexpr auto kDoubleIntegerPrecisionLimit = std::uint64_t{1}
+                                              << std::numeric_limits<double>::digits;
+constexpr int kAddedCounterFieldNumber = 100;
 const char *Env(const char *key, const char *fallback) {
     const char *value = std::getenv(key);
     return value ? value : fallback;
+}
+unsigned int ConfiguredPort(const char *setting = "PBMYSQL_TEST_PORT") {
+    const char *configured = std::getenv(setting);
+    return configured ? static_cast<unsigned int>(std::stoul(configured)) : MYSQL_PORT;
 }
 class MysqlIntegration : public ::testing::Test {
   protected:
@@ -22,8 +33,7 @@ class MysqlIntegration : public ::testing::Test {
     void Connect(Database &target) {
         target.Connect(Env("PBMYSQL_TEST_HOST", "127.0.0.1"), Env("PBMYSQL_TEST_USER", "root"),
                        Env("PBMYSQL_TEST_PASSWORD", ""),
-                       Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
-                       static_cast<unsigned>(std::stoul(Env("PBMYSQL_TEST_PORT", "3306"))));
+                       Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"), ConfiguredPort());
         target.SetDbName(Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"));
         target.RegisterTable(Row::default_instance(), options);
     }
@@ -73,14 +83,14 @@ TEST_F(MysqlIntegration, ExactSaveBinaryZeroUniqueConflictAndIgnore) {
         db.Save(conflict);
         FAIL() << "alternate unique key must not update id=1";
     } catch (const MysqlError &error) {
-        EXPECT_EQ(error.value(), 1062u);
+        EXPECT_EQ(error.value(), ER_DUP_ENTRY);
     }
     EXPECT_FALSE(db.InsertIgnore(conflict));
     loaded.Clear();
     loaded.set_id(1);
     ASSERT_TRUE(db.FindOneByPrimaryKey(loaded));
     EXPECT_EQ(loaded.gold(), 0u);
-    conflict.set_email(std::string(192, 'e'));
+    conflict.set_email(std::string(kDefaultKeyLength + 1, 'e'));
     EXPECT_THROW(db.InsertIgnore(conflict), std::invalid_argument);
     EXPECT_TRUE(db.GenerateMigrationSql(Row::default_instance()).empty());
 }
@@ -181,7 +191,7 @@ TEST_F(MysqlIntegration, ConcurrentFencesCannotOverwriteNewerRows) {
 }
 TEST_F(MysqlIntegration, OnlineMigrationPreservesRenamedDataAndRejectsUnsafeDrift) {
     auto row = Target();
-    row.set_data(std::string("saved\0blob", 10));
+    row.set_data("saved\0blob"s);
     db.Save(row);
     const auto quoted = QuoteIdentifier(table);
     db.Execute("ALTER TABLE " + quoted +
@@ -217,7 +227,8 @@ TEST_F(MysqlIntegration, OnlineMigrationPreservesRenamedDataAndRejectsUnsafeDrif
 }
 
 TEST_F(MysqlIntegration, TypedQueriesPaginationAndSingleRowCardinalityMatchGo) {
-    auto first = Target(9007199254740992ULL), second = Target(9007199254740993ULL);
+    auto first = Target(kDoubleIntegerPrecisionLimit),
+         second = Target(kDoubleIntegerPrecisionLimit + 1);
     db.BatchInsert({&first, &second});
     Row loaded;
     ASSERT_TRUE(db.FindOneByKV(loaded, "id", std::to_string(second.id())));
@@ -253,7 +264,7 @@ TEST_F(MysqlIntegration, OldWriterPreservesColumnsOnlyKnownToNewerDescriptor) {
     Row::descriptor()->file()->CopyTo(files.add_file());
     auto *added = files.mutable_file(0)->mutable_message_type(0)->add_field();
     added->set_name("new_counter");
-    added->set_number(100);
+    added->set_number(kAddedCounterFieldNumber);
     added->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
     added->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
     auto source = std::make_shared<DescriptorSet>(files);
@@ -261,8 +272,7 @@ TEST_F(MysqlIntegration, OldWriterPreservesColumnsOnlyKnownToNewerDescriptor) {
     Database newer_db;
     newer_db.Connect(Env("PBMYSQL_TEST_HOST", "127.0.0.1"), Env("PBMYSQL_TEST_USER", "root"),
                      Env("PBMYSQL_TEST_PASSWORD", ""),
-                     Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
-                     static_cast<unsigned>(std::stoul(Env("PBMYSQL_TEST_PORT", "3306"))));
+                     Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"), ConfiguredPort());
     newer_db.RegisterTable(*newer, options);
     newer_db.CreateOrUpdateTable(*newer);
     const auto *fields = newer->GetDescriptor();
@@ -285,7 +295,7 @@ TEST_F(MysqlIntegration, SharedClusterUsesCurrentReadsAcrossTwoDatabaseNodes) {
     Database second;
     second.Connect(second_host, Env("PBMYSQL_TEST_USER", "root"), Env("PBMYSQL_TEST_PASSWORD", ""),
                    Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
-                   static_cast<unsigned>(std::stoul(Env("PBMYSQL_TEST_PORT2", "3306"))));
+                   ConfiguredPort("PBMYSQL_TEST_PORT2"));
     second.RegisterTable(Row::default_instance(), options);
     auto row = Target();
     row.set_epoch(2);

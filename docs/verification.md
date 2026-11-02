@@ -1,8 +1,26 @@
 # 验证记录
 
-本轮对照 Go 源码提交 `e81a1e79105864610232139a57a28df273b866eb`，排除 Go 专用 GORM/context；原 Go 工作区未修改。C++ 基础快照先以 `0e21503` 推送，本轮补齐工作在同一 `codex/go-parity-fixes` 分支继续完成。
+对照 Go 源码提交 `e81a1e79105864610232139a57a28df273b866eb`，排除 Go 专用 GORM/context；原 Go 工作区未修改。C++ 基础移植为 `0e21503`，数据库行为补齐和跨平台验证为 `5219080`；本记录保留各阶段的实际验证范围。
 
-## 完整测试矩阵
+## 数字常量清理回归（2026-11-02）
+
+清理范围和保留数字的依据见 [数字常量的来源](numeric-constants.md)。最终源码重新构建后，每套完整 CTest 共 132 项，比前一阶段新增 8 项：UTF-8/hex/FNV/标识符边界、浮点极值、Timestamp 边界，以及 legacy 批量 SQL 的表名关键字回归。
+
+| 环境 | 后端 | PASS | SKIP | FAIL |
+|---|---|---:|---:|---:|
+| Linux GCC 13.4 / Protobuf 35.1 / C++20 | MySQL 8.4.13 | 131 | 1 | 0 |
+| Linux GCC 13.4 / Protobuf 3.21.12 / C++17 | MySQL 8.4.13 | 131 | 1 | 0 |
+| Windows MSVC 19.51 / Protobuf 35.1 / C++20 | MySQL 8.4.13 | 131 | 1 | 0 |
+
+每组跳过的 1 项均为双节点专用用例。Windows 和 Linux 安装后的消费者各为 3 PASS / 0 SKIP / 0 FAIL，覆盖 direct、static 注册保留和 shared/module 配置期拒绝。
+
+Linux Release / `BUILD_TESTING=OFF` 的库、CLI 构建及安装通过；Linux Release 和 Windows Debug 安装目录均确认包含新增的两个共享头文件。
+
+首次验证期间源码修正与编译任务发生重叠，旧对象被增量构建复用，新增 SQL 回归用例检出了该问题。强制重编相关源文件后，以上三套均重新完整执行；首次日志另存为 `pre-final-snapshot`，最终结果不与旧运行拼接。
+
+本轮日志位于本地 `verification/constants/`。以下 TiDB 和 Go 参考库结果属于数据库行为补齐阶段。
+
+## 数据库行为补齐的完整测试矩阵
 
 每组完整 CTest 套件共 124 项。跳过项只涉及该后端不适用的能力，不能把跳过计作执行成功。
 

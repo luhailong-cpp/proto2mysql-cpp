@@ -1,4 +1,6 @@
 #include "src/mysql_wrapper/database.h"
+#include "src/mysql_wrapper/database_limits.h"
+#include <mysqld_error.h>
 
 #include "db_base.pb.h"
 #include "proto2mysql_option.pb.h"
@@ -14,6 +16,7 @@ namespace pbmysql {
 namespace {
 using Message = google::protobuf::Message;
 using Field = google::protobuf::FieldDescriptor;
+inline constexpr std::int64_t kVersionIncrement = 1;
 
 StringVector NonPKColumns(const MessageTable &table) {
     StringVector result;
@@ -74,7 +77,7 @@ bool Database::InsertIgnore(const Message &message) {
         Insert(message);
         return true;
     } catch (const MysqlError &error) {
-        if (error.value() == 1062)
+        if (error.value() == ER_DUP_ENTRY)
             return false;
         throw;
     }
@@ -102,8 +105,8 @@ void Database::BatchInsert(const std::vector<const Message *> &messages) {
         table->ValidateMessage(*message);
         SQLBuilder(*table).Insert(*message);
     }
-    for (size_t start = 0; start < messages.size(); start += 1000) {
-        const auto end = std::min(start + 1000, messages.size());
+    for (size_t start = 0; start < messages.size(); start += kBatchSize) {
+        const auto end = std::min(start + kBatchSize, messages.size());
         std::vector<const Message *> chunk(messages.begin() + start, messages.begin() + end);
         Execute(SQLBuilder(*table).BatchInsert(chunk));
         for (auto *message : chunk)
@@ -154,7 +157,7 @@ void Database::Save(const Message &message) {
         InvalidateMessage(table, message);
         return;
     } catch (const MysqlError &error) {
-        if (error.value() != 1062)
+        if (error.value() != ER_DUP_ENTRY)
             throw;
         const auto duplicate = std::current_exception();
         Execute(update);
@@ -253,7 +256,7 @@ ConditionalSaveResult Database::SaveConditional(const Message &message,
     std::optional<std::vector<uint64_t>> compared;
     std::vector<uint64_t> last;
     try {
-        for (int round = 0; round < 2; ++round) {
+        for (int round = 0; round < kConditionalSaveMaxRounds; ++round) {
             Execute(update);
             if (AffectedRows() > 0) {
                 InvalidateMessage(table, message);
@@ -268,7 +271,7 @@ ConditionalSaveResult Database::SaveConditional(const Message &message,
                     InvalidateMessage(table, message);
                     return {SaveOutcome::Inserted, {}};
                 } catch (const MysqlError &error) {
-                    if (error.value() != 1062)
+                    if (error.value() != ER_DUP_ENTRY)
                         throw;
                     duplicate = std::current_exception();
                     state = read_state();
@@ -374,7 +377,7 @@ bool Database::UpdateFieldsIfVersion(const Message &message, const std::string &
         assigns.push_back(
             SetCol(name, FieldValue(message, table->Descriptor()->FindFieldByName(name))));
     }
-    assigns.push_back(AddCol(version, int64_t{1}));
+    assigns.push_back(AddCol(version, kVersionIncrement));
     auto pk = SQLBuilder(*table).PrimaryKeyWhere(message);
     auto args = pk.args;
     args.push_back(current);
@@ -384,7 +387,7 @@ bool Database::UpdateFieldsIfVersion(const Message &message, const std::string &
     if (changed)
         InvalidateMessage(table, message);
     if (changed)
-        InvalidateShiftedPrimaryKey(*table, message, version, 1);
+        InvalidateShiftedPrimaryKey(*table, message, version, kVersionIncrement);
     return changed;
 }
 void Database::IncrByPrimaryKey(const Message &message, const std::string &field, int64_t delta) {
@@ -453,8 +456,8 @@ void Database::BatchDelete(const std::vector<const Message *> &messages) {
         columns += QuoteIdentifier(name);
         placeholders += '?';
     }
-    for (size_t start = 0; start < messages.size(); start += 1000) {
-        const auto end = std::min(start + 1000, messages.size());
+    for (size_t start = 0; start < messages.size(); start += kBatchSize) {
+        const auto end = std::min(start + kBatchSize, messages.size());
         std::string where = "(" + columns + ") IN (";
         std::vector<SqlValue> args;
         for (size_t i = start; i < end; ++i) {

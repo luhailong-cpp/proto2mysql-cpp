@@ -23,6 +23,12 @@ jobs:
       PBMYSQL_TEST_USER: root
       PBMYSQL_TEST_PASSWORD: proto2mysql_test
       PBMYSQL_TEST_DATABASE: proto2mysql_test
+      PBMYSQL_TEST_TIDB_PORT: 33400
+      PBMYSQL_TEST_TIDB0_PORT: 33401
+      PBMYSQL_TEST_TIDB1_PORT: 33402
+      PBMYSQL_TEST_SINGLE_READY_ATTEMPTS: 90
+      PBMYSQL_TEST_CLUSTER_READY_ATTEMPTS: 120
+      PBMYSQL_TEST_READY_POLL_SECONDS: 2
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libprotobuf-dev protobuf-compiler default-libmysqlclient-dev default-mysql-client libgtest-dev
@@ -38,31 +44,31 @@ jobs:
           ctest --test-dir build-consumer --output-on-failure
       - name: TiDB single-node tests
         env:
-          PBMYSQL_TEST_PORT: 33400
+          PBMYSQL_TEST_PORT: ${{ env.PBMYSQL_TEST_TIDB_PORT }}
           PBMYSQL_TEST_PASSWORD: ''
         run: |
           docker compose -f test/docker-compose.yml up -d tidb
           ready=0
-          for attempt in $(seq 1 90); do
-            if mysql --protocol=TCP -h127.0.0.1 -P33400 -uroot -e 'CREATE DATABASE IF NOT EXISTS proto2mysql_test'; then ready=1; break; fi
-            sleep 2
+          for attempt in $(seq 1 "$PBMYSQL_TEST_SINGLE_READY_ATTEMPTS"); do
+            if mysql --protocol=TCP -h127.0.0.1 -P"$PBMYSQL_TEST_PORT" -uroot -e 'CREATE DATABASE IF NOT EXISTS proto2mysql_test'; then ready=1; break; fi
+            sleep "$PBMYSQL_TEST_READY_POLL_SECONDS"
           done
           test "$ready" = 1
           ctest --test-dir build --output-on-failure
           docker compose -f test/docker-compose.yml stop tidb
       - name: TiDB two-node cluster tests
         env:
-          PBMYSQL_TEST_PORT: 33401
+          PBMYSQL_TEST_PORT: ${{ env.PBMYSQL_TEST_TIDB0_PORT }}
           PBMYSQL_TEST_PASSWORD: ''
           PBMYSQL_TEST_HOST2: 127.0.0.1
-          PBMYSQL_TEST_PORT2: 33402
+          PBMYSQL_TEST_PORT2: ${{ env.PBMYSQL_TEST_TIDB1_PORT }}
         run: |
           docker compose -f test/docker-compose.yml up -d pd tikv tidb0 tidb1
-          for port in 33401 33402; do
+          for port in "$PBMYSQL_TEST_PORT" "$PBMYSQL_TEST_PORT2"; do
             ready=0
-            for attempt in $(seq 1 120); do
+            for attempt in $(seq 1 "$PBMYSQL_TEST_CLUSTER_READY_ATTEMPTS"); do
               if mysql --protocol=TCP -h127.0.0.1 -P"$port" -uroot -e 'CREATE DATABASE IF NOT EXISTS proto2mysql_test'; then ready=1; break; fi
-              sleep 2
+              sleep "$PBMYSQL_TEST_READY_POLL_SECONDS"
             done
             test "$ready" = 1
           done

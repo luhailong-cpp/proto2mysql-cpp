@@ -1,4 +1,6 @@
 #include "src/mysql_wrapper/sql_builder.h"
+#include "src/mysql_wrapper/database_limits.h"
+#include <string_view>
 
 #include <algorithm>
 #include <cctype>
@@ -37,13 +39,15 @@ std::string Trim(std::string value) {
 }
 std::string Where(std::string value, bool required = false) {
     value = Trim(value);
-    if (value.size() >= 5) {
-        std::string prefix = value.substr(0, 5);
+    constexpr std::string_view kWhereKeyword = "where";
+    if (value.size() >= kWhereKeyword.size()) {
+        std::string prefix = value.substr(0, kWhereKeyword.size());
         std::transform(prefix.begin(), prefix.end(), prefix.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (prefix == "where" &&
-            (value.size() == 5 || std::isspace(static_cast<unsigned char>(value[5]))))
-            value = Trim(value.substr(5));
+        if (std::string_view(prefix) == kWhereKeyword &&
+            (value.size() == kWhereKeyword.size() ||
+             std::isspace(static_cast<unsigned char>(value[kWhereKeyword.size()]))))
+            value = Trim(value.substr(kWhereKeyword.size()));
     }
     if (required && value.empty())
         throw std::invalid_argument("empty WHERE clause");
@@ -175,8 +179,8 @@ Statement SQLBuilder::InsertColumns(const std::vector<const Message *> &messages
                                     const StringVector &columns, bool replace) const {
     if (messages.empty())
         throw std::invalid_argument("empty message batch");
-    if (messages.size() > 1000)
-        throw std::invalid_argument("batch size exceeds maximum 1000");
+    if (messages.size() > kBatchSize)
+        throw std::invalid_argument("batch size exceeds maximum " + std::to_string(kBatchSize));
     StringVector quoted;
     for (const auto &column : columns) {
         Field(column);

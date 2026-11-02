@@ -1,16 +1,22 @@
 #include "runtime_test.pb.h"
 #include "src/mysql_wrapper/cache_codec.h"
 #include "src/mysql_wrapper/database.h"
+#include "src/mysql_wrapper/database_limits.h"
 #include <deque>
+#include <errmsg.h>
 #include <functional>
 #include <gtest/gtest.h>
 #include <limits>
+#include <mysqld_error.h>
 #include <unordered_map>
 
 namespace {
 using namespace pbmysql;
 using Row = pbmysql::test::RuntimeRow;
+using namespace std::string_literals;
+constexpr std::string_view kGoCacheHeader = "P2MC\x01";
 using Cells = std::vector<std::optional<std::string>>;
+inline constexpr int kCacheTTLSeconds = 60;
 struct FakeDatabase : Database {
     std::deque<uint64_t> writes;
     std::deque<std::optional<Cells>> reads;
@@ -116,13 +122,13 @@ TEST(DatabaseSave, AlternateUniqueConflictRethrows1062WithoutUpsert) {
     db.reads = {std::nullopt};
     db.on_write = [](const Statement &statement) {
         if (statement.sql.find("INSERT INTO") == 0)
-            throw MysqlError(1062, "duplicate");
+            throw MysqlError(ER_DUP_ENTRY, "duplicate");
     };
     try {
         db.Save(Target());
         FAIL() << "duplicate must be returned";
     } catch (const MysqlError &error) {
-        EXPECT_EQ(error.value(), 1062u);
+        EXPECT_EQ(error.value(), ER_DUP_ENTRY);
     }
     ASSERT_EQ(db.statements.size(), 4u);
     for (const auto &statement : db.statements)
@@ -135,7 +141,7 @@ TEST(DatabaseSave, ConcurrentPrimaryInsertRetriesUpdate) {
     db.reads = {std::nullopt, Cells{"6", "100"}};
     db.on_write = [](const Statement &statement) {
         if (statement.sql.find("INSERT INTO") == 0)
-            throw MysqlError(1062, "concurrent PK insert");
+            throw MysqlError(ER_DUP_ENTRY, "concurrent PK insert");
     };
     auto result = db.SaveConditional(Target(), Fence());
     EXPECT_EQ(result.outcome, SaveOutcome::Updated);
@@ -144,7 +150,7 @@ TEST(DatabaseSave, ConcurrentPrimaryInsertRetriesUpdate) {
 TEST(DatabaseSave, RejectedFenceLeavesCacheAndDoesNotInsert) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     db.writes = {0};
     db.reads = {Cells{"8", "2"}};
     auto result = db.SaveConditional(Target(), Fence());
@@ -181,7 +187,7 @@ TEST(DatabaseSave, EqualFenceUsesCurrentReadBytewiseMatch) {
 TEST(DatabaseSave, BoundedRaceIsReportedAndInvalidatesCache) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     db.writes = {0, 0};
     db.reads = {Cells{"6", "9"}, Cells{"6", "10"}};
     try {
@@ -227,9 +233,9 @@ TEST(DatabaseSave, PreserveFieldsOnlyAffectsUpdate) {
 }
 TEST(DatabaseSave, InsertIgnoreOnlyCatchesDuplicate) {
     FakeDatabase db;
-    db.on_write = [](const Statement &) { throw MysqlError(1062, "duplicate"); };
+    db.on_write = [](const Statement &) { throw MysqlError(ER_DUP_ENTRY, "duplicate"); };
     EXPECT_FALSE(db.InsertIgnore(Target()));
-    db.on_write = [](const Statement &) { throw MysqlError(1406, "too long"); };
+    db.on_write = [](const Statement &) { throw MysqlError(ER_DATA_TOO_LONG, "too long"); };
     EXPECT_THROW(db.InsertIgnore(Target()), MysqlError);
 }
 TEST(DatabaseSave, VersionUpdateHandlesCollectionsWithoutSingularReflection) {
@@ -269,7 +275,7 @@ TEST(DatabaseSave, CollectionEqualityComparesTheBytesActuallyWritten) {
 TEST(DatabaseTransactions, ExceptionRollsBackAndDoesNotInvalidate) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     db.writes = {1};
     EXPECT_THROW(db.Transaction([](Database &tx) {
         tx.Save(Target());
@@ -284,7 +290,7 @@ TEST(DatabaseTransactions, ExceptionRollsBackAndDoesNotInvalidate) {
 TEST(DatabaseTransactions, CommitDefersAndDeduplicatesInvalidation) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     db.writes = {1, 1};
     const auto committed = db.Transaction([&](Database &tx) {
         tx.Save(Target());
@@ -311,11 +317,11 @@ TEST(DatabaseTransactions, NestedTransactionsAndDdlFailBeforeImplicitCommit) {
 TEST(DatabaseTransactions, CommitErrorInvalidatesUnknownOutcomeAndResetsState) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     db.writes = {1};
     db.on_control = [](const std::string &sql) {
         if (sql == "COMMIT")
-            throw MysqlError(2013, "lost connection");
+            throw MysqlError(CR_SERVER_LOST, "lost connection");
     };
     EXPECT_THROW(db.Transaction([](Database &tx) {
         tx.Save(Target());
@@ -329,15 +335,15 @@ TEST(DatabaseTransactions, CommitErrorInvalidatesUnknownOutcomeAndResetsState) {
 TEST(DatabaseCache, CorruptEnvelopePreservesPrimaryKeyForDbFallback) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     auto row = Target();
     auto key = db.CacheKey(row);
     cache.values[key] = EncodeCacheEntry(row) + std::string(1, '\xff');
-    db.reads = {Cells{"1", "db-email", "3", "7", "9", std::string("a\0b", 3), std::nullopt}};
+    db.reads = {Cells{"1", "db-email", "3", "7", "9", "a\0b"s, std::nullopt}};
     ASSERT_TRUE(db.FindOneByPrimaryKey(row));
     EXPECT_EQ(std::get<uint64_t>(db.statements[0].args[0]), 1u);
     EXPECT_EQ(row.email(), "db-email");
-    EXPECT_EQ(row.data(), std::string("a\0b", 3));
+    EXPECT_EQ(row.data(), "a\0b"s);
 }
 TEST(DatabaseCache, EnvelopeIsCompatibleAndRejectsMissingWriterFields) {
     auto row = Target();
@@ -345,7 +351,7 @@ TEST(DatabaseCache, EnvelopeIsCompatibleAndRejectsMissingWriterFields) {
     Row out;
     ASSERT_TRUE(DecodeCacheEntry(encoded, out));
     EXPECT_EQ(out.SerializeAsString(), row.SerializeAsString());
-    std::string old("P2MC\x01", 5);
+    std::string old(kGoCacheHeader);
     AppendCacheVarint(old, 1);
     AppendCacheVarint(old, 1);
     old += row.SerializeAsString();
@@ -353,7 +359,7 @@ TEST(DatabaseCache, EnvelopeIsCompatibleAndRejectsMissingWriterFields) {
     EXPECT_FALSE(DecodeCacheEntry(old, out));
     EXPECT_EQ(out.id(), 55u);
     EXPECT_FALSE(DecodeCacheEntry(row.SerializeAsString(), out));
-    EXPECT_FALSE(DecodeCacheEntry(std::string("P2MC\x01\xff", 6), out));
+    EXPECT_FALSE(DecodeCacheEntry(std::string(kGoCacheHeader) + '\xff', out));
 }
 TEST(DatabaseCache, CompositeComponentsAndTableNameAreEscaped) {
     FakeDatabase db;
@@ -370,7 +376,7 @@ TEST(DatabaseCache, CacheFailureDegradesAndTransactionBypassesReads) {
     FakeDatabase db;
     MemoryCache cache;
     cache.fail = true;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     auto row = Target();
     db.reads = {Cells{"1", "e", "0", "7", "9", "", std::nullopt}};
     EXPECT_TRUE(db.FindOneByPrimaryKey(row));
@@ -393,12 +399,12 @@ TEST(DatabaseSchema, LongTableNamesUseBoundedStableAdvisoryLockNames) {
     FakeDatabase db;
     db.SetDbName("game");
     TableOptions options;
-    options.table_name = std::string(64, 't');
+    options.table_name = std::string(kMaxIdentifierLength, 't');
     db.RegisterTable(Row::default_instance(), options);
     db.reads = {Cells{"1"}, Cells{"0"}, Cells{"1"}};
     db.CreateOrUpdateTable(Target());
     ASSERT_EQ(db.statements.size(), 3u);
-    EXPECT_LE(std::get<std::string>(db.statements.front().args[0]).size(), 64u);
+    EXPECT_LE(std::get<std::string>(db.statements.front().args[0]).size(), kMaxIdentifierLength);
     EXPECT_EQ(db.statements.front().args[0], db.statements.back().args[0]);
 }
 TEST(DatabaseSchema, UnconfirmedReleaseIsReported) {
@@ -410,12 +416,12 @@ TEST(DatabaseSchema, UnconfirmedReleaseIsReported) {
 TEST(DatabaseSchema, MigrationFailureStillReleasesLockAndPreservesOriginalError) {
     FakeDatabase db;
     db.reads = {Cells{"1"}, Cells{"0"}, Cells{"1"}};
-    db.on_control = [](const std::string &) { throw MysqlError(1064, "DDL failed"); };
+    db.on_control = [](const std::string &) { throw MysqlError(ER_PARSE_ERROR, "DDL failed"); };
     try {
         db.CreateOrUpdateTable(Target());
         FAIL();
     } catch (const MysqlError &error) {
-        EXPECT_EQ(error.value(), 1064u);
+        EXPECT_EQ(error.value(), ER_PARSE_ERROR);
     }
     EXPECT_NE(db.statements.back().sql.find("RELEASE_LOCK"), std::string::npos);
 }
@@ -525,8 +531,8 @@ TEST(DatabaseBatch, DeleteUsesEveryComponentOfTheCompositePrimaryKey) {
 TEST(DatabaseBatch, FailedLaterDeleteChunkInvalidatesCompletedRows) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
-    std::vector<Row> rows(1001);
+    db.EnableCache(&cache, kCacheTTLSeconds);
+    std::vector<Row> rows(kBatchSize + 1);
     std::vector<const google::protobuf::Message *> messages;
     for (size_t i = 0; i < rows.size(); ++i) {
         rows[i].set_id(i + 1);
@@ -535,12 +541,12 @@ TEST(DatabaseBatch, FailedLaterDeleteChunkInvalidatesCompletedRows) {
     unsigned writes = 0;
     db.on_write = [&](const Statement &) {
         if (++writes == 2)
-            throw MysqlError(1205, "timeout");
+            throw MysqlError(ER_LOCK_WAIT_TIMEOUT, "timeout");
     };
-    db.writes = {1000};
+    db.writes = {kBatchSize};
     EXPECT_THROW(db.BatchDelete(messages), MysqlError);
     EXPECT_EQ(writes, 2u);
-    EXPECT_EQ(cache.deleted.size(), 1000u);
+    EXPECT_EQ(cache.deleted.size(), kBatchSize);
 }
 TEST(DatabaseVersion, NumericVersionsAndEmptyUpdateRulesMatchGo) {
     FakeDatabase db;
@@ -565,7 +571,7 @@ TEST(DatabaseVersion, NumericVersionsAndEmptyUpdateRulesMatchGo) {
 TEST(DatabaseCache, BatchedInvalidationValidatesBeforeDeletingAnything) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     auto row = Target();
     EXPECT_THROW(db.InvalidateCache(std::vector<const google::protobuf::Message *>{&row, nullptr}),
                  std::invalid_argument);
@@ -577,7 +583,7 @@ TEST(DatabaseCreate, ConcurrentInsertRemainsADuplicateError) {
     FakeDatabase db;
     auto row = Target();
     db.reads = {std::nullopt};
-    db.on_write = [](const Statement &) { throw MysqlError(1062, "concurrent insert"); };
+    db.on_write = [](const Statement &) { throw MysqlError(ER_DUP_ENTRY, "concurrent insert"); };
     bool created = true;
     EXPECT_THROW(db.FindOrCreate(row, &created), MysqlError);
     EXPECT_FALSE(created);
@@ -586,7 +592,7 @@ TEST(DatabaseCreate, ConcurrentInsertRemainsADuplicateError) {
 TEST(DatabaseCache, PrimaryKeyChangesInvalidateBothOldAndNewIdentity) {
     FakeDatabase db;
     MemoryCache cache;
-    db.EnableCache(&cache, 60);
+    db.EnableCache(&cache, kCacheTTLSeconds);
     auto row = Target();
     db.writes = {1};
     db.UpdateKVByPK(row, "id", uint64_t{2});

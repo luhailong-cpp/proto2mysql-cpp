@@ -1,8 +1,12 @@
 #include "src/mysql_wrapper/sql_builder.h"
+#include <charconv>
+#include <chrono>
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/timestamp.pb.h>
+#include <google/protobuf/util/time_util.h>
 #include <gtest/gtest.h>
+#include <limits>
 
 namespace {
 using namespace pbmysql;
@@ -157,6 +161,55 @@ TEST_F(CodecParity, IntegerBoundariesAreExactAndFailuresLeaveMessageUnchanged) {
         EXPECT_THROW(ParseRow(*message, bad), std::invalid_argument);
         EXPECT_EQ(message->SerializeAsString(), expected);
     }
+}
+
+TEST_F(CodecParity, FloatingFormatterHandlesFiniteExtremesWithoutFixedBuffers) {
+    for (const auto value :
+         {std::numeric_limits<double>::max(), std::numeric_limits<double>::lowest(),
+          std::numeric_limits<double>::denorm_min(), 0.0}) {
+        const auto text = ValueText(value);
+        double parsed{};
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+        ASSERT_EQ(result.ec, std::errc{});
+        EXPECT_EQ(result.ptr, text.data() + text.size());
+        EXPECT_EQ(parsed, value);
+    }
+    for (const auto value :
+         {std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest(),
+          std::numeric_limits<float>::denorm_min(), 0.0f}) {
+        message->GetReflection()->SetFloat(message.get(), F("ratio"), value);
+        const auto text = std::get<std::string>(FieldValue(*message, F("ratio")));
+        float parsed{};
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+        ASSERT_EQ(result.ec, std::errc{});
+        EXPECT_EQ(result.ptr, text.data() + text.size());
+        EXPECT_EQ(parsed, value);
+    }
+}
+
+TEST_F(CodecParity, TimestampFormattingRespectsPublicBoundsAndMicrosecondPrecision) {
+    using google::protobuf::util::TimeUtil;
+    auto *timestamp = message->GetReflection()->MutableMessage(message.get(), F("time"));
+    const auto *descriptor = timestamp->GetDescriptor();
+    const auto *reflection = timestamp->GetReflection();
+    for (const auto &bounds : std::vector<std::pair<std::string, std::string>>{
+             {"1000-01-01T00:00:00Z", "1000-01-01 00:00:00.000000"},
+             {"9999-12-31T23:59:59.999999999Z", "9999-12-31 23:59:59.999999"}}) {
+        google::protobuf::Timestamp parsed;
+        ASSERT_TRUE(TimeUtil::FromString(bounds.first, &parsed));
+        reflection->SetInt64(timestamp, descriptor->FindFieldByName("seconds"), parsed.seconds());
+        reflection->SetInt32(timestamp, descriptor->FindFieldByName("nanos"), parsed.nanos());
+        EXPECT_EQ(std::get<std::string>(FieldValue(*message, F("time"))), bounds.second);
+    }
+    const auto invalid_nanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds{1}).count();
+    reflection->SetInt32(timestamp, descriptor->FindFieldByName("nanos"),
+                         static_cast<int32_t>(invalid_nanos));
+    EXPECT_THROW(FieldValue(*message, F("time")), std::invalid_argument);
+    reflection->SetInt32(timestamp, descriptor->FindFieldByName("nanos"), 0);
+    reflection->SetInt64(timestamp, descriptor->FindFieldByName("seconds"),
+                         TimeUtil::kTimestampMaxSeconds + 1);
+    EXPECT_THROW(FieldValue(*message, F("time")), std::invalid_argument);
 }
 
 TEST(CodecPreflight, SyntheticOptionalZeroAndNullRetainPresence) {

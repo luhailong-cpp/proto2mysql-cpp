@@ -1,6 +1,7 @@
 #include "db_base.pb.h"
 #include "src/mysql_wrapper/database.h"
 #include "src/mysql_wrapper/identifier_utils.h"
+#include "src/mysql_wrapper/text_encoding.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mysqld_error.h>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -40,18 +42,17 @@ StringVector ValidateMappings(const Database::TableMap &tables) {
     });
     return keys;
 }
+inline constexpr std::int64_t kSchemaLockWaitSeconds = 30;
+enum class AdvisoryLockResult : std::int64_t { TimedOut, Acquired };
+enum class LockReleaseResult : std::int64_t { NotHeld, Released };
+inline constexpr std::int64_t kMissingLockResult = -1;
+enum DatabaseMetadataColumn : std::size_t { DatabaseName, CaseInsensitiveTableNames };
 std::string SyncLockName(const std::string &database) {
-    uint32_t hash = 2166136261u;
-    for (unsigned char byte : database) {
-        hash ^= byte;
-        hash *= 16777619u;
-    }
-    std::ostringstream name;
-    name << "proto2mysql:sync:" << std::hex << std::setw(8) << std::setfill('0') << hash;
-    return name.str();
+    return "proto2mysql:sync:" + Fnv1a32Hex(database);
 }
 bool UnsupportedAdvisoryLock(const MysqlError &error) {
-    if (error.value() != 1105 && error.value() != 1235 && error.value() != 1305)
+    if (error.value() != ER_UNKNOWN_ERROR && error.value() != ER_NOT_SUPPORTED_YET &&
+        error.value() != ER_SP_DOES_NOT_EXIST)
         return false;
     auto message = error.message();
     std::transform(message.begin(), message.end(), message.begin(),
@@ -136,8 +137,8 @@ void Database::SetDbName(const std::string &name) {
         auto row = QueryAtMostOne({"SELECT DATABASE(), @@lower_case_table_names", {}});
         if (!row)
             throw std::runtime_error("cannot determine connected database");
-        const auto current = Cell(*row, 0);
-        const bool case_insensitive = Cell(*row, 1) != "0";
+        const auto current = Cell(*row, DatabaseName);
+        const bool case_insensitive = Cell(*row, CaseInsensitiveTableNames) != "0";
         if (case_insensitive ? FoldIdentifier(current) != FoldIdentifier(name) : current != name)
             throw std::invalid_argument("connected database differs from requested database; "
                                         "choose the database when connecting");
@@ -396,11 +397,12 @@ void Database::SynchronizeTable(const Message &message, bool create_if_missing) 
     const auto lock = SyncLockName(db_name_);
     bool held = false;
     try {
-        const auto acquired = QueryScalar({"SELECT GET_LOCK(?, 30)", {lock}}, -1);
-        if (acquired == 1)
+        const auto acquired = QueryScalar({"SELECT GET_LOCK(?, ?)", {lock, kSchemaLockWaitSeconds}},
+                                          kMissingLockResult);
+        if (acquired == static_cast<std::int64_t>(AdvisoryLockResult::Acquired))
             held = true;
         else {
-            if (acquired != 0)
+            if (acquired != static_cast<std::int64_t>(AdvisoryLockResult::TimedOut))
                 Disconnect();
             throw std::runtime_error("schema lock unavailable");
         }
@@ -419,7 +421,9 @@ void Database::SynchronizeTable(const Message &message, bool create_if_missing) 
         if (!held)
             return;
         try {
-            if (QueryScalar({"SELECT RELEASE_LOCK(?)", {lock}}, 0) != 1)
+            if (QueryScalar({"SELECT RELEASE_LOCK(?)", {lock}},
+                            static_cast<std::int64_t>(LockReleaseResult::NotHeld)) !=
+                static_cast<std::int64_t>(LockReleaseResult::Released))
                 throw std::runtime_error("schema lock release was not confirmed");
         } catch (...) {
             Disconnect();

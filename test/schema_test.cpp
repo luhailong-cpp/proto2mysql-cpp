@@ -1,3 +1,4 @@
+#include "src/mysql_wrapper/database_limits.h"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
 #include <gtest/gtest.h>
@@ -11,6 +12,16 @@ using namespace google::protobuf;
 using pbmysql::MessageTable;
 using pbmysql::TableOptions;
 
+const std::string kDefaultKeyLengthSql = std::to_string(pbmysql::kDefaultKeyLength);
+template <std::size_t ColumnCount, class Consumer>
+void FeedMetadata(const char *(&row)[ColumnCount], Consumer consume) {
+    unsigned long lengths[ColumnCount]{};
+    for (std::size_t column = 0; column < ColumnCount; ++column)
+        if (row[column])
+            lengths[column] =
+                static_cast<unsigned long>(std::char_traits<char>::length(row[column]));
+    consume(const_cast<MYSQL_ROW>(row), lengths, static_cast<uint32_t>(ColumnCount));
+}
 struct SchemaFixture {
     DescriptorPool pool{DescriptorPool::generated_pool()};
     DynamicMessageFactory factory{&pool};
@@ -51,27 +62,35 @@ void Column(MessageTable &table, const std::string &name, const std::string &typ
             const char *collation = nullptr) {
     const char *row[] = {name.c_str(),  type.c_str(),  comment.c_str(), nullable.c_str(),
                          default_value, extra.c_str(), collation};
-    unsigned long lengths[7]{};
-    for (int i = 0; i < 7; ++i)
-        if (row[i])
-            lengths[i] = static_cast<unsigned long>(std::char_traits<char>::length(row[i]));
-    table.OnSelectColumn(const_cast<MYSQL_ROW>(row), lengths, 7);
+    FeedMetadata(row, [&](const MYSQL_ROW &data, const unsigned long *lengths, uint32_t count) {
+        return table.OnSelectColumn(data, lengths, count);
+    });
 }
 void Index(MessageTable &table, const std::string &name, bool unique, int sequence,
            const std::string &column, const char *prefix = nullptr) {
     const auto seq = std::to_string(sequence);
     const char *row[] = {
         name.c_str(), unique ? "0" : "1", seq.c_str(), column.c_str(), prefix, "BTREE", "A"};
-    unsigned long lengths[7]{};
-    for (int i = 0; i < 7; ++i)
-        if (row[i])
-            lengths[i] = static_cast<unsigned long>(std::char_traits<char>::length(row[i]));
-    table.OnSelectIndex(const_cast<MYSQL_ROW>(row), lengths, 7);
+    FeedMetadata(row, [&](const MYSQL_ROW &data, const unsigned long *lengths, uint32_t count) {
+        return table.OnSelectIndex(data, lengths, count);
+    });
 }
 void Existing(SchemaFixture &, MessageTable &table) {
     Column(table, "id", "bigint unsigned", "pb:1");
     Column(table, "name", "mediumtext", "pb:2", "YES", nullptr);
     Column(table, "data", "mediumblob", "pb:3", "YES", nullptr);
+}
+
+TEST(Schema, LegacyBatchInsertKeepsValuesKeywordInsideTableName) {
+    SchemaFixture fixture;
+    fixture.message->mutable_options()->SetExtension(proto2mysql::table_name, "someVALUES name");
+    const auto &prototype = fixture.Build();
+    std::unique_ptr<Message> row(prototype.New());
+    row->GetReflection()->SetUInt64(row.get(), row->GetDescriptor()->FindFieldByName("id"), 7);
+    MessageTable table(*row);
+    EXPECT_EQ(table.BatchInsertSql({row.get(), row.get()}, nullptr),
+              "INSERT INTO `someVALUES name` (`id`, `name`, `data`) VALUES "
+              "(7, X'', X''), (7, X'', X'')");
 }
 
 TEST(Schema, ReadsModernAndLegacyOptionsAndOwnsPrototype) {
@@ -105,7 +124,8 @@ TEST(Schema, KeyColumnsUseFullBinaryIdentityAndValidateUtf8) {
     EXPECT_NE(
         ddl.find("VARCHAR(2) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''"),
         std::string::npos);
-    EXPECT_NE(ddl.find("VARBINARY(191) NOT NULL DEFAULT ''"), std::string::npos);
+    EXPECT_NE(ddl.find("VARBINARY(" + kDefaultKeyLengthSql + ") NOT NULL DEFAULT ''"),
+              std::string::npos);
     auto m = std::unique_ptr<Message>(prototype.New());
     auto *field = m->GetDescriptor()->FindFieldByName("name");
     m->GetReflection()->SetString(m.get(), field, "ab");
@@ -132,7 +152,8 @@ TEST(Schema, RejectsInvalidOptionsBeforeProducingDDL) {
     EXPECT_THROW(MessageTable(p, bad), std::invalid_argument);
     bad = {};
     bad.primary_keys = pbmysql::StringVector{"name", "data"};
-    bad.max_lengths = std::unordered_map<std::string, uint32_t>{{"name", 768}, {"data", 1}};
+    bad.max_lengths = std::unordered_map<std::string, uint32_t>{
+        {"name", pbmysql::kMaxIndexBytes / pbmysql::kUtf8MaxBytesPerCodePoint}, {"data", 1}};
     EXPECT_THROW(MessageTable(p, bad), std::invalid_argument);
 }
 TEST(Schema, PreservesWiderColumnAndRenamesByFieldNumber) {
@@ -176,8 +197,8 @@ TEST(Schema, AddsMissingSecondaryIndexesAndChecksOnlinePrimaryKey) {
     Index(table, "PRIMARY", true, 1, "id");
     const auto clauses = table.BuildAlterClauses();
     ASSERT_EQ(clauses.size(), 1);
-    EXPECT_EQ(clauses[0], "ADD KEY `idx_record_0` (`name`(191))");
-    Index(table, "idx_record_0", false, 1, "name", "191");
+    EXPECT_EQ(clauses[0], "ADD KEY `idx_record_0` (`name`(" + kDefaultKeyLengthSql + "))");
+    Index(table, "idx_record_0", false, 1, "name", kDefaultKeyLengthSql.c_str());
     EXPECT_TRUE(table.BuildAlterClauses().empty());
     table.ClearExistingIndexes();
     Index(table, "PRIMARY", true, 1, "name");
@@ -192,7 +213,7 @@ TEST(Schema, IndexRenamesFollowColumnFieldNumbers) {
     Column(table, "data", "mediumblob", "pb:3", "YES", nullptr);
     table.ClearExistingIndexes();
     Index(table, "PRIMARY", true, 1, "id");
-    Index(table, "idx_record_0", false, 1, "old_name", "191");
+    Index(table, "idx_record_0", false, 1, "old_name", kDefaultKeyLengthSql.c_str());
     ASSERT_EQ(table.BuildAlterClauses().size(), 1);
     EXPECT_NE(table.AlterTableSql().find("CHANGE COLUMN `old_name` `name`"), std::string::npos);
 }
@@ -250,19 +271,19 @@ TEST(Schema, TiDBOptionsIgnoreClusteredShardAndClampPreSplit) {
     MessageTable sharded(clustered.DefaultInstance(), opts);
     EXPECT_NE(sharded.CreateTableSql().find("SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4"),
               std::string::npos);
-    opts.tidb_shard_row_id_bits = 16;
+    opts.tidb_shard_row_id_bits = pbmysql::kMaxTiDBShardRowIDBits + 1;
     EXPECT_THROW(MessageTable table(clustered.DefaultInstance(), opts), std::invalid_argument);
 }
 TEST(Schema, LongIndexNamesRetainUniqueDeterministicSuffix) {
     SchemaFixture f;
     TableOptions opts;
-    opts.table_name = std::string(64, 'a');
+    opts.table_name = std::string(pbmysql::kMaxIdentifierLength, 'a');
     opts.indexes = pbmysql::StringVector{"id", "name"};
     MessageTable table(f.Build(), opts);
     const auto sql = table.CreateTableSql();
     EXPECT_EQ(sql, table.CreateTableSql());
     EXPECT_NE(sql.find("idx_"), std::string::npos);
-    EXPECT_EQ(sql.find(std::string(65, 'a')), std::string::npos);
+    EXPECT_EQ(sql.find(std::string(pbmysql::kMaxIdentifierLength + 1, 'a')), std::string::npos);
 }
 } // namespace
 
@@ -323,7 +344,7 @@ TEST(SchemaMigration, LegacyUniqueKeyProducesManualAlterReportAndClassifiedError
     Existing(fixture, table);
     table.ClearExistingIndexes();
     Index(table, "PRIMARY", true, 1, "id");
-    Index(table, "uk_record", true, 1, "name", "191");
+    Index(table, "uk_record", true, 1, "name", kDefaultKeyLengthSql.c_str());
     try {
         table.BuildMigrationStatements();
         FAIL();
@@ -339,7 +360,8 @@ TEST(SchemaMigration, LegacyUniqueKeyProducesManualAlterReportAndClassifiedError
         EXPECT_NE(
             r.ToString().find("UPDATE `schema_db`.`record` SET `name` = '' WHERE `name` IS NULL"),
             std::string::npos);
-        EXPECT_NE(r.ToString().find("MODIFY COLUMN `name` VARCHAR(191)"), std::string::npos);
+        EXPECT_NE(r.ToString().find("MODIFY COLUMN `name` VARCHAR(" + kDefaultKeyLengthSql + ")"),
+                  std::string::npos);
         EXPECT_NE(r.statements.back().find("ADD UNIQUE KEY `uk_record` (`name`)"),
                   std::string::npos);
     }
@@ -354,7 +376,8 @@ TEST(SchemaMigration, LegacyPrimaryShadowPreservesWiderColumnsAndExtraIndexes) {
     MessageTable table(f.Build(), options);
     table.SetDbName("db");
     Column(table, "id", "bigint unsigned", "pb:1", "NO", nullptr, "auto_increment");
-    Column(table, "old_name", "varchar(191)", "pb:2", "NO", "", "", "utf8mb4_unicode_ci");
+    Column(table, "old_name", "varchar(" + kDefaultKeyLengthSql + ")", "pb:2", "NO", "", "",
+           "utf8mb4_unicode_ci");
     Column(table, "data", "longblob", "pb:3", "YES", nullptr);
     Column(table, "orphan", "mediumtext", "", "YES", nullptr, "", "utf8mb4_unicode_ci");
     table.ClearExistingIndexes();
@@ -385,17 +408,20 @@ TEST(SchemaMigration, ShadowReportsUnsupportedExtraIndexesAndConcreteDependencie
     MessageTable table(f.Build());
     Existing(f, table);
     table.ClearExistingIndexes();
-    Index(table, "PRIMARY", true, 1, "name", "191");
+    Index(table, "PRIMARY", true, 1, "name", kDefaultKeyLengthSql.c_str());
     const char *idx[] = {"fulltext_name", "1", "1", "name", nullptr, "FULLTEXT", nullptr};
-    unsigned long il[] = {13, 1, 1, 4, 0, 8, 0};
-    table.OnSelectIndex(const_cast<MYSQL_ROW>(idx), il, 7);
+    FeedMetadata(idx, [&](const MYSQL_ROW &data, const unsigned long *lengths, uint32_t count) {
+        return table.OnSelectIndex(data, lengths, count);
+    });
     table.ClearDependencies();
     const char *fk[] = {"db", "fk_child_parent", "child", "record"};
-    unsigned long fl[] = {2, 15, 5, 6};
-    table.OnSelectForeignKey(const_cast<MYSQL_ROW>(fk), fl, 4);
+    FeedMetadata(fk, [&](const MYSQL_ROW &data, const unsigned long *lengths, uint32_t count) {
+        return table.OnSelectForeignKey(data, lengths, count);
+    });
     const char *tr[] = {"audit_record", "AFTER", "INSERT"};
-    unsigned long tl[] = {12, 5, 6};
-    table.OnSelectTrigger(const_cast<MYSQL_ROW>(tr), tl, 3);
+    FeedMetadata(tr, [&](const MYSQL_ROW &data, const unsigned long *lengths, uint32_t count) {
+        return table.OnSelectTrigger(data, lengths, count);
+    });
     const auto r = table.LegacyMigrationReport();
     EXPECT_NE(r.ToString().find("unsupported type fulltext"), std::string::npos);
     EXPECT_NE(r.ToString().find("fk_child_parent"), std::string::npos);
@@ -407,16 +433,21 @@ TEST(SchemaMigration, ShadowRespectsIndexBudgetAndAddsChecksForReducedKeyWidth) 
     f.message->mutable_options()->SetExtension(proto2mysql::primary_key, "name,data");
     MessageTable table(f.Build());
     Column(table, "id", "bigint unsigned", "pb:1");
-    Column(table, "name", "varchar(768)", "pb:2", "NO", "", "", "utf8mb4_0900_bin");
+    Column(table, "name",
+           "varchar(" +
+               std::to_string(pbmysql::kMaxIndexBytes / pbmysql::kUtf8MaxBytesPerCodePoint) + ")",
+           "pb:2", "NO", "", "", "utf8mb4_0900_bin");
     Column(table, "data", "mediumblob", "pb:3", "YES", nullptr);
     table.ClearExistingIndexes();
     Index(table, "PRIMARY", true, 1, "name");
-    Index(table, "PRIMARY", true, 2, "data", "191");
+    Index(table, "PRIMARY", true, 2, "data", kDefaultKeyLengthSql.c_str());
     const auto r = table.LegacyMigrationReport();
     EXPECT_TRUE(r.shadow_rebuild);
-    EXPECT_NE(r.statements[1].find("`name` VARCHAR(191)"), std::string::npos);
-    EXPECT_NE(r.ToString().find("3072-byte index budget"), std::string::npos);
-    EXPECT_NE(r.ToString().find("target `name` limit 191"), std::string::npos);
+    EXPECT_NE(r.statements[1].find("`name` VARCHAR(" + kDefaultKeyLengthSql + ")"),
+              std::string::npos);
+    EXPECT_NE(r.ToString().find(std::to_string(pbmysql::kMaxIndexBytes) + "-byte index budget"),
+              std::string::npos);
+    EXPECT_NE(r.ToString().find("target `name` limit " + kDefaultKeyLengthSql), std::string::npos);
 }
 TEST(SchemaMigration, ModernOptionsFallbackAndCheckedOfflineDDL) {
     SchemaFixture f;
@@ -448,7 +479,7 @@ TEST(SchemaMigration, PKValidationDoesNotInspectUnrelatedUniqueValue) {
     MessageTable table(p);
     std::unique_ptr<Message> m(p.New());
     m->GetReflection()->SetString(m.get(), m->GetDescriptor()->FindFieldByName("name"),
-                                  std::string(192, 'x'));
+                                  std::string(pbmysql::kDefaultKeyLength + 1, 'x'));
     EXPECT_NO_THROW(table.ValidatePrimaryKeyMessage(*m));
     EXPECT_THROW(table.ValidateMessage(*m), std::invalid_argument);
 }

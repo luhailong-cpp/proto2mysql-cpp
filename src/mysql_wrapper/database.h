@@ -81,7 +81,7 @@ class Database : public MysqlClient {
     uint64_t LastInsertId() override;
     uint64_t AffectedRows() override;
     void Connect(const std::string &host, const std::string &user, const std::string &password,
-                 const std::string &database, unsigned int port = 3306);
+                 const std::string &database, unsigned int port = MYSQL_PORT);
     void Connect(const std::string &host, const std::string &user, const std::string &password,
                  const std::string &database, unsigned int port, const ConnectionOptions &options);
     template <class ConnectionParameters> void Connect(const ConnectionParameters &parameters) {
