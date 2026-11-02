@@ -4,6 +4,7 @@
 #include "src/mysql_wrapper/value_codec.h"
 
 namespace pbmysql {
+std::string NormalizeWhereClause(const std::string &where);
 
 // WHERE, ORDER BY and SetColExpr are trusted SQL fragments. All values belong
 // in args. Validation errors throw std::invalid_argument before any SQL runs.
@@ -27,13 +28,27 @@ Assign KeepOld(std::string column);
 
 class SQLBuilder {
   public:
-    explicit SQLBuilder(const MessageTable &table) : table_(table) {}
+    explicit SQLBuilder(const MessageTable &table)
+        : owned_(std::make_shared<MessageTable>(table)), table_(*owned_) {}
     explicit SQLBuilder(const google::protobuf::Message &message, const TableOptions &options = {})
         : owned_(std::make_shared<MessageTable>(message, options)), table_(*owned_) {}
     const std::string &TableName() const { return table_.TableName(); }
     const MessageTable &Table() const { return table_; }
     std::string CreateTable() const { return table_.CreateTableSql(); }
     Statement PrimaryKeyWhere(const google::protobuf::Message &message) const;
+    SqlValue ComparisonValue(const std::string &column, const SqlValue &value) const;
+    SqlValue NormalizeComparisonValue(const std::string &column, const SqlValue &value) const {
+        return ComparisonValue(column, value);
+    }
+
+    // Low-level compatibility helpers: unlike Database::Save, identity-guarded
+    // ODKU cannot report an alternate UNIQUE collision; that path is a no-op.
+    Statement GetSaveSQLWithArgs(const google::protobuf::Message &message) const;
+    Statement
+    GetBatchSaveSQLWithArgs(const std::vector<const google::protobuf::Message *> &messages) const;
+    Statement GetInsertOnDupUpdateSQLWithArgs(const google::protobuf::Message &message) const;
+    Statement
+    GetInsertOnDupKeyForPrimaryKeyWithArgs(const google::protobuf::Message &message) const;
 
     Statement Insert(const google::protobuf::Message &message) const;
     Statement InsertSetFields(const google::protobuf::Message &message) const;
@@ -106,7 +121,7 @@ class SQLBuilder {
     Statement AppendDuplicate(Statement insert, const std::vector<Assign> &assigns) const;
     Statement DuplicateNoop(Statement insert) const;
     Statement InWhere(const std::string &column, const std::vector<SqlValue> &values) const;
-    SqlValue ComparisonValue(const std::string &column, const SqlValue &value) const;
+    std::vector<Assign> IdentityAssigns(const google::protobuf::Message *partial) const;
     std::string SinglePK() const;
     std::shared_ptr<const MessageTable> owned_;
     const MessageTable &table_;

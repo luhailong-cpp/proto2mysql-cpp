@@ -132,7 +132,7 @@ TEST_F(BuilderFixture, ExplicitUpdateWritesZeroAndPrimaryKeyStaysInWhere) {
     ASSERT_EQ(update.args.size(), 2u);
     EXPECT_EQ(std::get<uint64_t>(update.args[0]), 0u);
     EXPECT_EQ(std::get<uint64_t>(update.args[1]), 7u);
-    EXPECT_THROW(builder.UpdateByPK(*row), std::invalid_argument);
+    EXPECT_EQ(builder.UpdateByPK(*row).sql, "UPDATE `items` SET `id` = ? WHERE `id` = ?");
 }
 
 TEST_F(BuilderFixture, MutationRejectsEmptyWhereAndUnknownColumns) {
@@ -179,10 +179,11 @@ TEST_F(BuilderFixture, IgnorePreservesErrorsAndBatchAndGuardPreserveArgOrder) {
     EXPECT_EQ(std::get<int64_t>(batch.args.back()), 9);
     row->GetReflection()->SetString(row.get(), F("name"), "new");
     auto guarded = builder.UpdateByPKIf(*row, "`gold` >= ?", {uint64_t(10)});
-    ASSERT_EQ(guarded.args.size(), 3u);
-    EXPECT_EQ(std::get<std::string>(guarded.args[0]), "new");
-    EXPECT_EQ(std::get<uint64_t>(guarded.args[1]), 7u);
-    EXPECT_EQ(std::get<uint64_t>(guarded.args[2]), 10u);
+    ASSERT_EQ(guarded.args.size(), 4u);
+    EXPECT_EQ(std::get<uint64_t>(guarded.args[0]), 7u);
+    EXPECT_EQ(std::get<std::string>(guarded.args[1]), "new");
+    EXPECT_EQ(std::get<uint64_t>(guarded.args[2]), 7u);
+    EXPECT_EQ(std::get<uint64_t>(guarded.args[3]), 10u);
 }
 
 TEST_F(BuilderFixture, SelectionOptionsLocksAndLimitedDelete) {
@@ -235,6 +236,124 @@ TEST_F(BuilderFixture, InvalidBatchesAreRejectedBeforeReturningSQL) {
     EXPECT_THROW(builder.Insert(different), std::invalid_argument);
     row->Clear();
     EXPECT_THROW(builder.InsertSetFields(*row), std::invalid_argument);
+}
+
+TEST_F(BuilderFixture, QueryFallbackOffsetGuardAndInputArgumentsStayIndependent) {
+    SQLBuilder builder(*row);
+    EXPECT_EQ(builder.SelectColumns({}).sql, builder.SelectWhere().sql);
+    EXPECT_NE(builder.SelectWhere().sql.find(" WHERE 1=1"), std::string::npos);
+    EXPECT_EQ(builder.Count().sql, "SELECT COUNT(*) FROM `items` WHERE 1=1");
+    EXPECT_EQ(builder.Exists().sql, "SELECT 1 FROM `items` WHERE 1=1 LIMIT 1");
+    EXPECT_EQ(builder.SelectByPK(*row).sql.find("LIMIT"), std::string::npos);
+    QueryOptions options;
+    options.offset = 20;
+    EXPECT_EQ(builder.SelectWhere("", {}, options).sql.find("OFFSET"), std::string::npos);
+    options.limit = 5;
+    options.for_update = true;
+    EXPECT_NE(builder.SelectWhere("", {}, options).sql.find(" LIMIT 5 OFFSET 20 FOR UPDATE"),
+              std::string::npos);
+    std::vector<SqlValue> arguments{uint64_t(3), uint64_t(4)};
+    auto guarded = builder.DeleteByPKIf(*row, "`gold` = ? OR `gold` = ?", arguments);
+    EXPECT_EQ(guarded.sql, "DELETE FROM `items` WHERE (`id` = ?) AND (`gold` = ? OR `gold` = ?)");
+    guarded.args[1] = uint64_t(99);
+    EXPECT_EQ(std::get<uint64_t>(arguments[0]), 3u);
+    EXPECT_THROW(builder.DecrByPKIfEnough(*row, "gold", 0), std::invalid_argument);
+}
+
+TEST_F(BuilderFixture, OpaquePredicateBytesAreNotParsedOrReserialized) {
+    SQLBuilder builder(*row);
+    const std::string wire("\x08\x01\x3a\x01x", 5);
+    const auto selected = builder.SelectByKVIn("tags", {wire});
+    EXPECT_EQ(std::get<std::string>(selected.args[0]), wire);
+    const auto updated = builder.UpdateAssignsByPK(*row, {SetCol("tags", wire)});
+    EXPECT_EQ(std::get<std::string>(updated.args[0]), wire);
+    const auto timestamp =
+        builder.NormalizeComparisonValue("created_at", std::string("2026-01-02"));
+    EXPECT_EQ(std::get<std::string>(timestamp), "2026-01-02");
+}
+
+TEST_F(BuilderFixture, IdentityGuardedCompatibilityHelpersAndAllAssignOperators) {
+    SQLBuilder builder(*row);
+    row->GetReflection()->SetString(row.get(), F("name"), "new");
+    const auto save = builder.GetSaveSQLWithArgs(*row);
+    EXPECT_NE(save.sql.find("`name` = IF(`id` <=> VALUES(`id`), VALUES(`name`), `name`)"),
+              std::string::npos);
+    EXPECT_EQ(save.args.size(), 8u);
+    const auto partial = builder.GetInsertOnDupUpdateSQLWithArgs(*row);
+    EXPECT_NE(partial.sql.find("`name` = IF(`id` <=> VALUES(`id`), ?, `name`)"), std::string::npos);
+    EXPECT_EQ(partial.sql.find("`gold` = IF"), std::string::npos);
+    EXPECT_EQ(partial.args.size(), 9u);
+    EXPECT_NE(builder.GetInsertOnDupKeyForPrimaryKeyWithArgs(*row).sql.find("UPDATE `id` = `id`"),
+              std::string::npos);
+    EXPECT_EQ(builder.GetBatchSaveSQLWithArgs({row.get(), row.get()}).args.size(), 16u);
+    for (const auto &assign : {SetNew("gold"), AddNew("gold"), MinNew("gold"), MaxNew("gold"),
+                               SetNewIfZero("gold"), KeepOld("gold")}) {
+        const auto sql = builder.UpsertWith(*row, {assign});
+        EXPECT_NE(sql.sql.find(assign.expression), std::string::npos);
+        EXPECT_EQ(sql.args.size(), 8u);
+    }
+    auto repeated =
+        builder.UpdateAssignsByPK(*row, {AddCol("gold", int64_t(1)), SubCol("gold", int64_t(2))});
+    EXPECT_NE(repeated.sql.find("`gold` = `gold` + ?, `gold` = `gold` - ?"), std::string::npos);
+    EXPECT_EQ(builder.BatchInsertIgnore({row.get(), row.get()}).args.size(), 16u);
+    EXPECT_EQ(builder.BatchReplace({row.get(), row.get()}).sql.find("REPLACE INTO"), 0u);
+    EXPECT_EQ(builder.BatchUpsert({row.get()}, {"name"}).args.size(), 8u);
+    EXPECT_EQ(builder.SelectByPKForUpdate(*row).sql.find("FOR UPDATE"),
+              builder.SelectByPKForUpdate(*row).sql.size() - 10);
+}
+
+TEST_F(BuilderFixture, KeyValidationOnlyExaminesFieldsUsedByTheStatement) {
+    row->GetReflection()->SetString(row.get(), F("name"), "overlong");
+    TableOptions options;
+    options.unique_key = "name";
+    options.max_lengths = std::unordered_map<std::string, uint32_t>{{"name", 1}};
+    MessageTable table(*row, options);
+    SQLBuilder builder(table);
+    EXPECT_NO_THROW(builder.SelectByPK(*row));
+    EXPECT_NO_THROW(builder.DeleteByPK(*row));
+    EXPECT_NO_THROW(builder.UpdateFieldsByPK(*row, {"gold"}));
+    EXPECT_THROW(builder.Insert(*row), std::invalid_argument);
+    EXPECT_THROW(builder.UpdateFieldsByPK(*row, {"name"}), std::invalid_argument);
+    EXPECT_THROW(builder.NormalizeComparisonValue("name", std::string("long")),
+                 std::invalid_argument);
+}
+
+TEST_F(BuilderFixture, CompoundIdentityGuardIncludesEveryKeyAndPKOnlySaveIsNoop) {
+    TableOptions options;
+    options.primary_keys = StringVector{"id", "name"};
+    MessageTable table(*row, options);
+    SQLBuilder builder(table);
+    EXPECT_EQ(builder.PrimaryKeyWhere(*row).sql, "`id` = ? AND `name` = ?");
+    EXPECT_NE(builder.GetSaveSQLWithArgs(*row).sql.find(
+                  "IF(`id` <=> VALUES(`id`) AND `name` <=> VALUES(`name`),"),
+              std::string::npos);
+    EXPECT_THROW(builder.SelectByPKIn({uint64_t(1)}), std::invalid_argument);
+    google::protobuf::Timestamp key_only;
+    TableOptions pk_only;
+    pk_only.primary_keys = StringVector{"seconds", "nanos"};
+    SQLBuilder only(key_only, pk_only);
+    EXPECT_NE(
+        only.GetSaveSQLWithArgs(key_only).sql.find("ON DUPLICATE KEY UPDATE `seconds` = `seconds`"),
+        std::string::npos);
+    EXPECT_THROW(only.Upsert(key_only), std::invalid_argument);
+}
+
+TEST_F(BuilderFixture, BuilderOwnsMappingAcrossRegistryReplacementAndDestruction) {
+    std::unique_ptr<SQLBuilder> builder;
+    {
+        std::unordered_map<std::string, MessageTable> registry;
+        registry.emplace("first", MessageTable(*row));
+        builder = std::make_unique<SQLBuilder>(registry.at("first"));
+        auto replacement = registry;
+        TableOptions renamed;
+        renamed.table_name = "renamed_items";
+        replacement.insert_or_assign("second", MessageTable(*row, renamed));
+        registry = std::move(replacement);
+        EXPECT_EQ(builder->TableName(), "items");
+        EXPECT_EQ(builder->PrimaryKeyWhere(*row).args.size(), 1u);
+    }
+    EXPECT_EQ(builder->TableName(), "items");
+    EXPECT_EQ(builder->Insert(*row).args.size(), 8u);
 }
 
 TEST(CodecDeterministic, LargeMapsAndNestedMapsKeepStableWireBytes) {

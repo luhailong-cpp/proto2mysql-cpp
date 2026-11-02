@@ -21,6 +21,8 @@ SqlValue FieldValue(const google::protobuf::Message &message,
 // container, matching MySQL's promotion of the stored FLOAT during comparison.
 SqlValue FieldComparisonValue(const google::protobuf::Message &message,
                               const google::protobuf::FieldDescriptor *field);
+SqlValue NormalizeComparisonValue(const google::protobuf::FieldDescriptor *field,
+                                  const SqlValue &value);
 // Column order is descriptor field order. Parsing is atomic: errors leave the
 // caller's message unchanged, and successful reads clear previous field values.
 void ParseRow(google::protobuf::Message &message, const std::vector<SqlValue> &row);

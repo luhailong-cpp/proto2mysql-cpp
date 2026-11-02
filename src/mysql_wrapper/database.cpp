@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <unordered_set>
 
@@ -27,19 +28,6 @@ StringVector NonPKColumns(const MessageTable &table) {
 bool IsPK(const MessageTable &table, const std::string &name) {
     return std::find(table.PrimaryKeys().begin(), table.PrimaryKeys().end(), name) !=
            table.PrimaryKeys().end();
-}
-void RegisterDescriptor(Database &db, const google::protobuf::Descriptor *desc, bool modern) {
-    bool declared = modern ? desc->options().HasExtension(proto2mysql::table_name)
-                           : desc->options().HasExtension(OptionTableName);
-    if (declared) {
-        auto *prototype = google::protobuf::MessageFactory::generated_factory()->GetPrototype(desc);
-        if (!prototype)
-            throw std::invalid_argument("no generated prototype for " +
-                                        std::string(desc->full_name()));
-        db.RegisterTable(*prototype);
-    }
-    for (int i = 0; i < desc->nested_type_count(); ++i)
-        RegisterDescriptor(db, desc->nested_type(i), modern);
 }
 Statement MatchRow(const MessageTable &table, const Message &message, const StringVector &columns,
                    const std::vector<SqlValue> &written) {
@@ -72,188 +60,16 @@ std::string RowCell(const ResultRow &row, size_t index) {
         throw std::runtime_error("unexpected NULL or missing result column");
     return std::string(row[index], row.length(index));
 }
-std::string SchemaLockName(const std::string &database, const std::string &table) {
-    // MySQL limits lock names to 64 bytes. Hash a length-delimited identity so
-    // valid long table/database names remain synchronizable across processes.
-    uint64_t hash = 14695981039346656037ULL;
-    const std::string identity = std::to_string(database.size()) + ":" + database + table;
-    for (unsigned char byte : identity) {
-        hash ^= byte;
-        hash *= 1099511628211ULL;
-    }
-    return "p2m:" + std::to_string(hash);
-}
 } // namespace
 
-void Database::SetDbName(const std::string &name) {
-    if (in_transaction_)
-        throw std::logic_error("cannot change database during transaction");
-    db_name_ = name;
-    for (auto &entry : tables_)
-        entry.second.SetDbName(name);
-}
-void Database::RegisterTable(const Message &message, const TableOptions &options) {
-    if (in_transaction_)
-        throw std::logic_error("cannot register tables during transaction");
-    std::string key(message.GetDescriptor()->full_name());
-    MessageTable table(message, options);
-    table.SetDbName(db_name_);
-    // Erasing then replacing would lose the valid registration on validation
-    // failure. Fully validate the replacement before changing the registry.
-    table.CreateTableSql();
-    tables_.insert_or_assign(key, std::move(table));
-}
-void Database::RegisterAllTables(const google::protobuf::FileDescriptor *file) {
-    if (!file)
-        throw std::invalid_argument("null file descriptor");
-    const bool modern = file->options().HasExtension(proto2mysql::db);
-    if (modern && !file->options().GetExtension(proto2mysql::db))
-        return;
-    for (int i = 0; i < file->message_type_count(); ++i)
-        RegisterDescriptor(*this, file->message_type(i), modern);
-}
-MessageTable *Database::TableFor(const Message &message) {
-    auto it = tables_.find(std::string(message.GetDescriptor()->full_name()));
-    if (it == tables_.end())
-        throw std::invalid_argument("table not registered: " +
-                                    std::string(message.GetDescriptor()->full_name()));
-    it->second.ValidateMessage(message);
-    return &it->second;
-}
-SQLBuilder Database::Builder(const Message &message) { return SQLBuilder(*TableFor(message)); }
-std::string Database::GetCreateTableSql(const Message &message) {
-    return TableFor(message)->CreateTableSql();
-}
-void Database::WriteCreateTableSql(std::ostream &out) const {
-    std::vector<std::string> keys;
-    for (const auto &entry : tables_)
-        keys.push_back(entry.first);
-    std::sort(keys.begin(), keys.end());
-    std::vector<std::string> statements;
-    for (const auto &key : keys)
-        statements.push_back(tables_.at(key).CreateTableSql());
-    for (const auto &statement : statements)
-        out << statement << (statement.back() == ';' ? "" : ";") << "\n\n";
-    if (!out)
-        throw std::runtime_error("failed writing schema SQL");
-}
-void Database::DumpCreateTableSqlFile(const std::string &path) const {
-    std::ofstream out(path, std::ios::trunc);
-    if (!out)
-        throw std::runtime_error("cannot open schema file: " + path);
-    WriteCreateTableSql(out);
-}
-bool Database::IsTableExists(const std::string &name) {
-    return QueryScalar({"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND "
-                        "TABLE_NAME = ?",
-                        {db_name_, name}},
-                       0) > 0;
-}
-std::string Database::GenerateMigrationSql(const Message &message) {
-    auto *table = TableFor(message);
-    if (!IsTableExists(table->TableName()))
-        return table->CreateTableSql();
-    table->ClearExistingColumns();
-    Query(table->SelectColumnsSql(),
-          [table](const MYSQL_ROW &row, const unsigned long *lengths, uint32_t size) {
-              return table->OnSelectColumn(row, lengths, size);
-          });
-    table->ClearExistingIndexes();
-    Query(table->SelectIndexesSql(),
-          [table](const MYSQL_ROW &row, const unsigned long *lengths, uint32_t size) {
-              return table->OnSelectIndex(row, lengths, size);
-          });
-    return table->AlterTableSql();
-}
-void Database::WriteMigrationSql(std::ostream &out, const std::vector<const Message *> &messages) {
-    std::vector<std::string> statements;
-    for (auto *message : messages) {
-        if (!message)
-            throw std::invalid_argument("null migration message");
-        auto sql = GenerateMigrationSql(*message);
-        if (!sql.empty())
-            statements.push_back(std::move(sql));
-    }
-    for (const auto &sql : statements)
-        out << sql << (sql.back() == ';' ? "" : ";") << "\n\n";
-    if (!out)
-        throw std::runtime_error("failed writing migration SQL");
-}
-void Database::DumpMigrationSqlFile(const std::string &path,
-                                    const std::vector<const Message *> &messages) {
-    std::ofstream out(path, std::ios::trunc);
-    if (!out)
-        throw std::runtime_error("cannot open migration file: " + path);
-    WriteMigrationSql(out, messages);
-}
-void Database::CreateOrUpdateTable(const Message &message) {
-    if (in_transaction_)
-        throw std::logic_error("schema DDL implicitly commits transactions");
-    auto *table = TableFor(message);
-    // Serializes cooperating schema writers. GET_LOCK is session-scoped and
-    // survives MySQL's implicit DDL commit.
-    const std::string lock = SchemaLockName(db_name_, table->TableName());
-    int64_t acquired;
-    try {
-        acquired = QueryScalar({"SELECT GET_LOCK(?, 30)", {lock}}, 0);
-    } catch (...) {
-        Disconnect();
-        throw;
-    }
-    if (acquired != 0 && acquired != 1)
-        Disconnect();
-    if (acquired != 1)
-        throw std::runtime_error("schema lock unavailable");
-    auto release = [&] {
-        try {
-            if (QueryScalar({"SELECT RELEASE_LOCK(?)", {lock}}, 0) != 1)
-                throw std::runtime_error("schema lock release was not confirmed");
-        } catch (...) {
-            // Closing the session also releases advisory locks. A live session
-            // must never retain a lock after an ambiguous release failure.
-            Disconnect();
-            throw;
-        }
-    };
-    try {
-        const auto sql = GenerateMigrationSql(message);
-        if (!sql.empty())
-            Execute(sql);
-    } catch (...) {
-        try {
-            release();
-        } catch (...) {
-        }
-        throw;
-    }
-    release();
-}
-void Database::SyncAllTables() {
-    std::vector<std::string> keys;
-    for (const auto &entry : tables_)
-        keys.push_back(entry.first);
-    std::sort(keys.begin(), keys.end());
-    for (const auto &key : keys)
-        CreateOrUpdateTable(tables_.at(key).DefaultInstance());
-}
-int64_t Database::QueryScalar(const Statement &sql, int64_t fallback) {
-    auto row = QueryOne(sql);
-    if (!row)
-        return fallback;
-    auto cell = RowCell(*row, 0);
-    size_t pos;
-    auto value = std::stoll(cell, &pos);
-    if (pos != cell.size())
-        throw std::runtime_error("invalid integer query result");
-    return value;
-}
-
 void Database::Insert(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     Execute(SQLBuilder(*table).Insert(message));
     InvalidateMessage(table, message);
 }
 bool Database::InsertIgnore(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     try {
         Insert(message);
         return true;
@@ -264,11 +80,16 @@ bool Database::InsertIgnore(const Message &message) {
     }
 }
 uint64_t Database::InsertReturningId(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     Insert(message);
     return LastInsertId();
 }
-void Database::InsertOnDupUpdate(const Message &message) { Save(message); }
+void Database::InsertOnDupUpdate(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    Save(message);
+}
 void Database::BatchInsert(const std::vector<const Message *> &messages) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     if (messages.empty())
         return;
     // Validate the entire batch before the first write, including mixed types.
@@ -290,15 +111,63 @@ void Database::BatchInsert(const std::vector<const Message *> &messages) {
     }
 }
 void Database::BatchSave(const std::vector<const Message *> &messages) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    if (messages.empty())
+        return;
+    if (!messages.front())
+        throw std::invalid_argument("null batch message");
+    auto *table = TableFor(*messages.front());
+    for (const auto *message : messages) {
+        if (!message)
+            throw std::invalid_argument("null batch message");
+        table->ValidateMessage(*message);
+        SQLBuilder(*table).PrimaryKeyWhere(*message);
+        SQLBuilder(*table).Insert(*message);
+    }
     for (auto *message : messages) {
         if (!message)
             throw std::invalid_argument("null batch message");
         Save(*message);
     }
 }
-void Database::Save(const Message &message) { SaveConditional(message); }
+void Database::Save(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    auto *table = TableFor(message);
+    const SQLBuilder builder(*table);
+    const auto columns = NonPKColumns(*table);
+    auto pk = builder.PrimaryKeyWhere(message);
+    const auto update =
+        columns.empty()
+            ? Statement{"UPDATE " + QuoteIdentifier(table->TableName()) + " SET " +
+                            QuoteIdentifier(table->PrimaryKeys().front()) + " = " +
+                            QuoteIdentifier(table->PrimaryKeys().front()) + " WHERE " + pk.sql,
+                        pk.args}
+            : builder.UpdateFieldsByPK(message, columns);
+    const auto insert = builder.Insert(message);
+    Execute(update);
+    if (AffectedRows() > 0) {
+        InvalidateMessage(table, message);
+        return;
+    }
+    try {
+        Execute(insert);
+        InvalidateMessage(table, message);
+        return;
+    } catch (const MysqlError &error) {
+        if (error.value() != 1062)
+            throw;
+        const auto duplicate = std::current_exception();
+        Execute(update);
+        if (AffectedRows() > 0 || QueryAtMostOne(MatchRow(*table, message, columns, update.args))) {
+            InvalidateMessage(table, message);
+            return;
+        }
+        std::rethrow_exception(duplicate);
+    }
+}
 ConditionalSaveResult Database::SaveConditional(const Message &message,
                                                 const SaveOptions &options) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     SQLBuilder builder(*table);
     auto pk = builder.PrimaryKeyWhere(message);
@@ -361,11 +230,10 @@ ConditionalSaveResult Database::SaveConditional(const Message &message,
         options.fence_fields.empty() ? table->PrimaryKeys() : options.fence_fields;
     QueryOptions locked;
     locked.for_update = true;
-    locked.limit = 1;
     auto state_sql = builder.SelectColumns(state_columns, pk.sql, pk.args, locked);
     auto match_sql = MatchRow(*table, message, columns, update.args);
     auto read_state = [&]() -> std::pair<bool, std::vector<uint64_t>> {
-        auto row = QueryOne(state_sql);
+        auto row = QueryAtMostOne(state_sql);
         if (!row)
             return {false, {}};
         std::vector<uint64_t> stored;
@@ -417,7 +285,7 @@ ConditionalSaveResult Database::SaveConditional(const Message &message,
                 compared.reset();
                 continue;
             }
-            if (QueryOne(match_sql)) {
+            if (QueryAtMostOne(match_sql)) {
                 InvalidateMessage(table, message);
                 return {SaveOutcome::Unchanged, last};
             }
@@ -433,31 +301,47 @@ ConditionalSaveResult Database::SaveConditional(const Message &message,
 }
 
 void Database::Update(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     Execute(SQLBuilder(*table).UpdateByPK(message));
     InvalidateMessage(table, message);
 }
 void Database::UpdateByWhere(const Message &message, const std::string &where) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     UpdateByWhereWithArgs(message, where, {});
 }
 void Database::UpdateByWhereWithArgs(const Message &message, const std::string &where,
                                      const std::vector<SqlValue> &args) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     Execute(Builder(message).UpdateWhere(message, where, args));
 }
-void Database::UpdateKvByPrimaryKey(const Message &message, const std::string &field,
-                                    const std::string &value) {
+void Database::UpdateKVByPK(const Message &message, const std::string &field,
+                            const SqlValue &value) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
-    if (IsPK(*table, field))
-        throw std::invalid_argument("cannot update primary key");
-    Execute(SQLBuilder(*table).UpdateAssignsByPK(message, {SetCol(field, value)}));
+    const SQLBuilder builder(*table);
+    const auto normalized = builder.NormalizeComparisonValue(field, value);
+    auto keys = builder.PrimaryKeyWhere(message).args;
+    Execute(builder.UpdateAssignsByPK(message, {SetCol(field, normalized)}));
     InvalidateMessage(table, message);
+    if (IsPK(*table, field)) {
+        for (size_t i = 0; i < table->PrimaryKeys().size(); ++i)
+            if (table->PrimaryKeys()[i] == field)
+                keys[i] = normalized;
+        std::string key = "pb:" + EscapeCacheKeyPart(table->TableName());
+        for (const auto &part : keys)
+            key += ":" + EscapeCacheKeyPart(ValueText(part));
+        InvalidateKey(key);
+    }
 }
 void Database::UpdateFieldsByPrimaryKey(const Message &message, const StringVector &fields) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     Execute(SQLBuilder(*table).UpdateFieldsByPK(message, fields));
     InvalidateMessage(table, message);
 }
 bool Database::UpdateIfVersion(const Message &message, const std::string &version) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     StringVector fields;
     for (const auto &name : NonPKColumns(*table)) {
@@ -472,20 +356,21 @@ bool Database::UpdateIfVersion(const Message &message, const std::string &versio
 }
 bool Database::UpdateFieldsIfVersion(const Message &message, const std::string &version,
                                      const StringVector &fields) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    if (fields.empty())
+        throw std::invalid_argument("no fields to update");
     auto *table = TableFor(message);
     auto *field = table->Descriptor()->FindFieldByName(version);
-    if (!field || field->is_repeated() || !IsNumericField(field) || IsPK(*table, version) ||
-        field->cpp_type() == Field::CPPTYPE_FLOAT || field->cpp_type() == Field::CPPTYPE_DOUBLE ||
-        field->cpp_type() == Field::CPPTYPE_BOOL || field->cpp_type() == Field::CPPTYPE_ENUM)
-        throw std::invalid_argument("version must be a non-primary integer field");
-    auto current = FieldValue(message, field);
+    if (!field || !IsNumericField(field))
+        throw std::invalid_argument("version must be a numeric scalar field");
+    auto current = FieldComparisonValue(message, field);
     // Validate selected columns via builder before adding the version expression.
     if (!fields.empty())
         SQLBuilder(*table).UpdateFieldsByPK(message, fields);
     std::vector<Assign> assigns;
     for (const auto &name : fields) {
         if (name == version)
-            throw std::invalid_argument("version cannot also be assigned explicitly");
+            continue;
         assigns.push_back(
             SetCol(name, FieldValue(message, table->Descriptor()->FindFieldByName(name))));
     }
@@ -498,157 +383,102 @@ bool Database::UpdateFieldsIfVersion(const Message &message, const std::string &
     bool changed = AffectedRows() > 0;
     if (changed)
         InvalidateMessage(table, message);
+    if (changed)
+        InvalidateShiftedPrimaryKey(*table, message, version, 1);
     return changed;
 }
 void Database::IncrByPrimaryKey(const Message &message, const std::string &field, int64_t delta) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     Execute(SQLBuilder(*table).IncrByPK(message, field, delta));
     InvalidateMessage(table, message);
+    if (AffectedRows() > 0)
+        InvalidateShiftedPrimaryKey(*table, message, field, delta);
 }
 bool Database::DecrByPrimaryKeyIfEnough(const Message &message, const std::string &field,
                                         int64_t delta) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     Execute(SQLBuilder(*table).DecrByPKIfEnough(message, field, delta));
     bool changed = AffectedRows() > 0;
     if (changed)
         InvalidateMessage(table, message);
+    if (changed)
+        InvalidateShiftedPrimaryKey(*table, message, field, -delta);
     return changed;
 }
 void Database::Delete(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     Execute(SQLBuilder(*table).DeleteByPK(message));
     InvalidateMessage(table, message);
 }
-void Database::DeleteByKv(const Message &message, const std::string &key,
-                          const std::string &value) {
+void Database::DeleteByKV(const Message &message, const std::string &key, const SqlValue &value) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
-    if (!table->HasField(key))
-        throw std::invalid_argument("unknown field: " + key);
-    Execute(SQLBuilder(*table).DeleteWhere(QuoteIdentifier(key) + " = ?", {value}));
+    const SQLBuilder builder(*table);
+    Execute(builder.DeleteWhere(QuoteIdentifier(key) + " = ?",
+                                {builder.NormalizeComparisonValue(key, value)}));
 }
 void Database::DeleteByWhere(const Message &message, const std::string &where) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     DeleteByWhereWithArgs(message, where, {});
 }
 void Database::DeleteByWhereWithArgs(const Message &message, const std::string &where,
                                      const std::vector<SqlValue> &args) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     Execute(Builder(message).DeleteWhere(where, args));
 }
 void Database::BatchDelete(const std::vector<const Message *> &messages) {
-    for (auto *message : messages) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    if (messages.empty())
+        return;
+    if (!messages.front())
+        throw std::invalid_argument("null delete message");
+    auto *table = TableFor(*messages.front());
+    const SQLBuilder builder(*table);
+    std::vector<std::vector<SqlValue>> keys;
+    for (const auto *message : messages) {
         if (!message)
             throw std::invalid_argument("null delete message");
-        Delete(*message);
+        keys.push_back(builder.PrimaryKeyWhere(*message).args);
     }
-}
-
-bool Database::FindOneByPrimaryKey(Message &message) {
-    auto *table = TableFor(message);
-    if (cache_ && !in_transaction_) {
-        try {
-            std::string value;
-            if (cache_->Get(CacheKey(message), &value) && DecodeCacheEntry(value, message))
-                return true;
-        } catch (...) {
-        } // Cache failures never change DB results.
-    }
-    auto row = QueryOne(SQLBuilder(*table).SelectByPK(message));
-    if (!row)
-        return false;
-    ParseFromRow(message, *row);
-    if (cache_ && !in_transaction_) {
-        try {
-            cache_->Set(CacheKey(message), EncodeCacheEntry(message), cache_ttl_seconds_);
-        } catch (...) {
+    std::string columns;
+    std::string placeholders;
+    for (const auto &name : table->PrimaryKeys()) {
+        if (!columns.empty()) {
+            columns += ", ";
+            placeholders += ", ";
         }
+        columns += QuoteIdentifier(name);
+        placeholders += '?';
     }
-    return true;
-}
-bool Database::FindOneByPrimaryKeyForUpdate(Message &message) {
-    if (!in_transaction_)
-        throw std::logic_error("FOR UPDATE requires Transaction()");
-    auto row = QueryOne(Builder(message).SelectByPKForUpdate(message));
-    if (!row)
-        return false;
-    ParseFromRow(message, *row);
-    return true;
-}
-bool Database::FindOrCreate(Message &message, bool *created) {
-    if (created)
-        *created = false;
-    if (FindOneByPrimaryKey(message))
-        return true;
-    try {
-        Insert(message);
-        if (created)
-            *created = true;
-        return true;
-    } catch (const MysqlError &error) {
-        if (error.value() != 1062)
-            throw;
-        // A duplicate on a different unique row must remain an error. Bypass
-        // cache and use a current read to classify a concurrent PK insertion.
-        auto row = QueryOne(Builder(message).SelectByPKForUpdate(message));
-        if (!row)
-            throw;
-        ParseFromRow(message, *row);
-        return true;
+    for (size_t start = 0; start < messages.size(); start += 1000) {
+        const auto end = std::min(start + 1000, messages.size());
+        std::string where = "(" + columns + ") IN (";
+        std::vector<SqlValue> args;
+        for (size_t i = start; i < end; ++i) {
+            if (i != start)
+                where += ", ";
+            where += "(" + placeholders + ")";
+            args.insert(args.end(), keys[i].begin(), keys[i].end());
+        }
+        Execute(builder.DeleteWhere(where + ")", args));
+        for (size_t i = start; i < end; ++i)
+            InvalidateMessage(table, *messages[i]);
     }
-}
-bool Database::FindOneByKv(Message &message, const std::string &key, const std::string &value) {
-    auto *table = TableFor(message);
-    if (!table->HasField(key))
-        throw std::invalid_argument("unknown field: " + key);
-    return FindOneByWhereWithArgs(message, QuoteIdentifier(key) + " = ?", {value});
-}
-bool Database::FindOneByWhere(Message &message, const std::string &where) {
-    return FindOneByWhereWithArgs(message, where, {});
-}
-bool Database::FindOneByWhereWithArgs(Message &message, const std::string &where,
-                                      const std::vector<SqlValue> &args) {
-    QueryOptions options;
-    options.limit = 1;
-    auto row = QueryOne(Builder(message).SelectWhere(where, args, options));
-    if (!row)
-        return false;
-    ParseFromRow(message, *row);
-    return true;
-}
-bool Database::FindOneWithOptions(Message &message, const std::string &where,
-                                  const QueryOptions &options) {
-    auto one = options;
-    one.limit = 1;
-    if (one.for_update && !in_transaction_)
-        throw std::logic_error("FOR UPDATE requires Transaction()");
-    auto row = QueryOne(Builder(message).SelectWhere(where, {}, one));
-    if (!row)
-        return false;
-    ParseFromRow(message, *row);
-    return true;
-}
-void Database::FindMultiByWhereClauses(const std::vector<MultiQuery> &queries) {
-    for (const auto &query : queries) {
-        if (!query.message)
-            throw std::invalid_argument("null query message");
-        FindOneByWhere(*query.message, query.where_clause);
-    }
-}
-int64_t Database::Count(const Message &message) { return QueryScalar(Builder(message).Count(), 0); }
-int64_t Database::CountByWhere(const Message &message, const std::string &where) {
-    return QueryScalar(Builder(message).Count(where), 0);
-}
-bool Database::Exists(const Message &message, const std::string &where) {
-    return QueryOne(Builder(message).Exists(where)) != nullptr;
-}
-bool Database::ExistsByPrimaryKey(const Message &message) {
-    auto builder = Builder(message);
-    auto pk = builder.PrimaryKeyWhere(message);
-    return QueryOne(builder.Exists(pk.sql, pk.args)) != nullptr;
 }
 
 bool Database::Transaction(const std::function<bool(Database &)> &fn) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     if (in_transaction_)
         throw std::logic_error("nested transactions are unsupported");
-    Execute(std::string("START TRANSACTION"));
+    try {
+        Execute(std::string("START TRANSACTION"));
+    } catch (...) {
+        Disconnect();
+        throw;
+    }
     in_transaction_ = true;
     pending_cache_deletes_.clear();
     bool committed = false;
@@ -667,6 +497,8 @@ bool Database::Transaction(const std::function<bool(Database &)> &fn) {
             rolled_back = true;
         } catch (...) {
         }
+        if (!rolled_back)
+            Disconnect();
         in_transaction_ = false;
         // COMMIT failures can have an unknown outcome. Invalidating cached rows
         // is safe even when the server rolled back.
@@ -684,12 +516,14 @@ bool Database::Transaction(const std::function<bool(Database &)> &fn) {
     return committed;
 }
 void Database::EnableCache(Cache *cache, int ttl_seconds) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     if (in_transaction_)
         throw std::logic_error("cannot replace cache during transaction");
     cache_ = cache;
     cache_ttl_seconds_ = ttl_seconds;
 }
 std::string Database::CacheKey(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     auto *table = TableFor(message);
     auto pk = SQLBuilder(*table).PrimaryKeyWhere(message);
     std::string key = "pb:" + EscapeCacheKeyPart(table->TableName());
@@ -698,9 +532,22 @@ std::string Database::CacheKey(const Message &message) {
     return key;
 }
 void Database::InvalidateCache(const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     InvalidateMessage(TableFor(message), message);
 }
+void Database::InvalidateCache(const std::vector<const Message *> &messages) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    std::vector<std::string> keys;
+    for (const auto *message : messages) {
+        if (!message)
+            throw std::invalid_argument("null cache message");
+        keys.push_back(CacheKey(*message));
+    }
+    for (const auto &key : keys)
+        InvalidateKey(key);
+}
 void Database::InvalidateMessage(MessageTable *, const Message &message) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     if (!cache_)
         return;
     std::string key;
@@ -709,6 +556,12 @@ void Database::InvalidateMessage(MessageTable *, const Message &message) {
     } catch (...) {
         return;
     }
+    InvalidateKey(key);
+}
+void Database::InvalidateKey(const std::string &key) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    if (!cache_)
+        return;
     if (in_transaction_)
         pending_cache_deletes_.push_back(key);
     else {
@@ -718,7 +571,37 @@ void Database::InvalidateMessage(MessageTable *, const Message &message) {
         }
     }
 }
+void Database::InvalidateShiftedPrimaryKey(MessageTable &table, const Message &message,
+                                           const std::string &field, int64_t delta) {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
+    if (!cache_ || !IsPK(table, field) || delta == 0)
+        return;
+    auto keys = SQLBuilder(table).PrimaryKeyWhere(message).args;
+    for (size_t i = 0; i < table.PrimaryKeys().size(); ++i) {
+        if (table.PrimaryKeys()[i] != field)
+            continue;
+        if (auto *value = std::get_if<uint64_t>(&keys[i])) {
+            const auto amount = delta >= 0 ? static_cast<uint64_t>(delta)
+                                           : uint64_t{0} - static_cast<uint64_t>(delta);
+            if ((delta >= 0 && *value > std::numeric_limits<uint64_t>::max() - amount) ||
+                (delta < 0 && *value < amount))
+                return;
+            *value = delta >= 0 ? *value + amount : *value - amount;
+        } else if (auto *value = std::get_if<int64_t>(&keys[i])) {
+            if ((delta > 0 && *value > std::numeric_limits<int64_t>::max() - delta) ||
+                (delta < 0 && *value < std::numeric_limits<int64_t>::min() - delta))
+                return;
+            *value += delta;
+        } else
+            return;
+    }
+    std::string key = "pb:" + EscapeCacheKeyPart(table.TableName());
+    for (const auto &part : keys)
+        key += ":" + EscapeCacheKeyPart(ValueText(part));
+    InvalidateKey(key);
+}
 void Database::FlushPendingCacheDeletes() {
+    std::lock_guard<std::recursive_mutex> operation_lock(operation_mutex_);
     if (cache_) {
         std::set<std::string> unique(pending_cache_deletes_.begin(), pending_cache_deletes_.end());
         for (const auto &key : unique) {

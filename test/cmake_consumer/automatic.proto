@@ -1,0 +1,9 @@
+syntax = "proto3";
+package helper_probe;
+import "proto2mysql_option.proto";
+option (proto2mysql.db) = true;
+message UnreferencedRow {
+  option (proto2mysql.table_name) = "helper_generated";
+  option (proto2mysql.primary_key) = "id";
+  uint64 id = 1;
+}

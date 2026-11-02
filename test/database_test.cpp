@@ -14,6 +14,7 @@ using Cells = std::vector<std::optional<std::string>>;
 struct FakeDatabase : Database {
     std::deque<uint64_t> writes;
     std::deque<std::optional<Cells>> reads;
+    std::deque<std::vector<Cells>> row_sets;
     std::vector<Statement> statements;
     std::vector<std::string> controls;
     std::function<void(const Statement &)> on_write;
@@ -45,6 +46,23 @@ struct FakeDatabase : Database {
         return std::make_unique<ResultRow>(*row);
     }
     uint64_t AffectedRows() override { return affected; }
+    void QueryResultRowProcessor(const Statement &statement,
+                                 const ResultRowProcessor &processor) override {
+        if (row_sets.empty()) {
+            auto row = QueryOne(statement);
+            if (row)
+                processor(row);
+            return;
+        }
+        statements.push_back(statement);
+        auto rows = row_sets.front();
+        row_sets.pop_front();
+        for (auto &cells : rows) {
+            auto row = std::make_unique<ResultRow>(std::move(cells));
+            if (!processor(row))
+                break;
+        }
+    }
 };
 struct MemoryCache : Cache {
     std::unordered_map<std::string, std::string> values;
@@ -94,8 +112,8 @@ TEST(DatabaseSave, FullRowSaveWritesZeroAndUsesExactPrimaryKey) {
 }
 TEST(DatabaseSave, AlternateUniqueConflictRethrows1062WithoutUpsert) {
     FakeDatabase db;
-    db.writes = {0};
-    db.reads = {std::nullopt, std::nullopt};
+    db.writes = {0, 0};
+    db.reads = {std::nullopt};
     db.on_write = [](const Statement &statement) {
         if (statement.sql.find("INSERT INTO") == 0)
             throw MysqlError(1062, "duplicate");
@@ -268,22 +286,24 @@ TEST(DatabaseTransactions, CommitDefersAndDeduplicatesInvalidation) {
     MemoryCache cache;
     db.EnableCache(&cache, 60);
     db.writes = {1, 1};
-    EXPECT_TRUE(db.Transaction([&](Database &tx) {
+    const auto committed = db.Transaction([&](Database &tx) {
         tx.Save(Target());
         tx.Save(Target());
         EXPECT_TRUE(cache.deleted.empty());
         return true;
-    }));
+    });
+    EXPECT_TRUE(committed);
     EXPECT_EQ(cache.deleted.size(), 1u);
     EXPECT_EQ(db.controls.back(), "COMMIT");
 }
 TEST(DatabaseTransactions, NestedTransactionsAndDdlFailBeforeImplicitCommit) {
     FakeDatabase db;
-    EXPECT_TRUE(db.Transaction([&](Database &tx) {
+    const auto committed = db.Transaction([&](Database &tx) {
         EXPECT_THROW(tx.Transaction([](Database &) { return true; }), std::logic_error);
         EXPECT_THROW(tx.CreateOrUpdateTable(Target()), std::logic_error);
         return true;
-    }));
+    });
+    EXPECT_TRUE(committed);
     EXPECT_EQ(db.controls.size(), 2u);
     Row row;
     EXPECT_THROW(db.FindOneByPrimaryKeyForUpdate(row), std::logic_error);
@@ -398,5 +418,199 @@ TEST(DatabaseSchema, MigrationFailureStillReleasesLockAndPreservesOriginalError)
         EXPECT_EQ(error.value(), 1064u);
     }
     EXPECT_NE(db.statements.back().sql.find("RELEASE_LOCK"), std::string::npos);
+}
+
+TEST(DatabaseQueries, SingleRowQueriesRejectMultipleRowsWithoutChangingTheDestination) {
+    FakeDatabase db;
+    auto row = Target();
+    row.set_email("unchanged");
+    db.row_sets = {{{"1", "first", "0", "7", "9", "", std::nullopt},
+                    {"2", "second", "0", "7", "9", "", std::nullopt}}};
+    EXPECT_THROW(db.FindOneByWhereWithArgs(row, "`gold` >= ?", {uint64_t{0}}), MultipleRowsError);
+    EXPECT_EQ(row.email(), "unchanged");
+    EXPECT_EQ(db.statements.front().sql.find("LIMIT 1"), std::string::npos);
+}
+TEST(DatabaseQueries, SingleRowOptionsResetOffsetAndKeepTypedParameters) {
+    FakeDatabase db;
+    Row row;
+    db.reads = {Cells{"1", "e", "0", "7", "9", "", std::nullopt}};
+    QueryOptions options;
+    options.limit = 99;
+    options.offset = 100;
+    options.order_by = "`id` DESC";
+    ASSERT_TRUE(db.FindOneWithOptions(row, "`id` = ?", {uint64_t{1}}, options));
+    EXPECT_NE(db.statements.front().sql.find("LIMIT 1"), std::string::npos);
+    EXPECT_EQ(db.statements.front().sql.find("OFFSET"), std::string::npos);
+    EXPECT_EQ(std::get<uint64_t>(db.statements.front().args[0]), 1u);
+}
+TEST(DatabaseQueries, ListsAllowScalarMetadataAndInferElementTypes) {
+    FakeDatabase db;
+    pbmysql::test::RuntimePage page;
+    page.set_total(200);
+    page.set_continuation("keep");
+    page.add_items()->set_id(99);
+    db.row_sets = {{{"1", "first", "0", "7", "9", "", std::nullopt},
+                    {"2", "second", "0", "7", "9", "", std::nullopt}}};
+    db.FindAllByWhereWithArgs(page, "`gold` >= ?", {uint64_t{0}});
+    ASSERT_EQ(page.items_size(), 2);
+    EXPECT_EQ(page.items(0).id(), 1u);
+    EXPECT_EQ(page.items(1).id(), 2u);
+    EXPECT_EQ(page.total(), 200);
+    EXPECT_EQ(page.continuation(), "keep");
+    db.FindAllByPKIn(page, {});
+    EXPECT_EQ(page.items_size(), 0);
+    EXPECT_EQ(page.total(), 200);
+}
+TEST(DatabaseQueries, TypedKvAndCursorValuesPreserveUnsignedPrecision) {
+    FakeDatabase db;
+    Row row;
+    const auto maximum = std::numeric_limits<uint64_t>::max();
+    db.reads = {std::nullopt};
+    EXPECT_FALSE(db.FindOneByKV(row, "id", std::to_string(maximum)));
+    EXPECT_EQ(std::get<uint64_t>(db.statements.back().args[0]), maximum);
+    pbmysql::test::RuntimePage page;
+    db.row_sets = {{}};
+    db.FindPageByCursor(page, "WHERE `gold` >= ?", {uint64_t{5}}, "id",
+                        SqlValue{std::to_string(maximum)}, 20);
+    EXPECT_EQ(std::get<uint64_t>(db.statements.back().args[0]), 5u);
+    EXPECT_EQ(std::get<uint64_t>(db.statements.back().args[1]), maximum);
+    EXPECT_NE(db.statements.back().sql.find("ORDER BY `id` ASC LIMIT 20"), std::string::npos);
+}
+TEST(DatabaseQueries, AggregatesAcceptListsAndParameterizedConditions) {
+    FakeDatabase db;
+    pbmysql::test::RuntimePage page;
+    db.reads = {Cells{"3"}, Cells{"1"}};
+    EXPECT_EQ(db.CountByWhereWithArgs(page, "`gold` > ?", {uint64_t{0}}), 3);
+    EXPECT_TRUE(db.Exists(page, "`id` = ?", {uint64_t{1}}));
+    EXPECT_EQ(std::get<uint64_t>(db.statements.back().args[0]), 1u);
+}
+TEST(DatabaseQueries, MultiQueryPreflightsEveryMessageAndKeepsArguments) {
+    FakeDatabase db;
+    Row a, b;
+    EXPECT_THROW(db.FindMultiByWhereClauses({}), std::invalid_argument);
+    EXPECT_THROW(db.FindMultiByWhereClauses({{&a, "`id` = ?", {uint64_t{1}}}, {nullptr, "", {}}}),
+                 std::invalid_argument);
+    EXPECT_TRUE(db.statements.empty());
+    db.reads = {Cells{"1", "a", "0", "7", "9", "", std::nullopt},
+                Cells{"2", "b", "0", "7", "9", "", std::nullopt}};
+    db.FindMultiByWhereClauses({{&a, "`id` = ?", {uint64_t{1}}}, {&b, "`id` = ?", {uint64_t{2}}}});
+    EXPECT_EQ(a.id(), 1u);
+    EXPECT_EQ(b.id(), 2u);
+}
+TEST(DatabaseBatch, MixedDescriptorsFailBeforeAnyWrite) {
+    FakeDatabase db;
+    auto row = Target();
+    pbmysql::test::CompositeRow different;
+    db.RegisterTable(different);
+    EXPECT_THROW(db.BatchInsert({&row, &different}), std::invalid_argument);
+    EXPECT_THROW(db.BatchSave({&row, &different}), std::invalid_argument);
+    EXPECT_THROW(db.BatchDelete({&row, &different}), std::invalid_argument);
+    EXPECT_TRUE(db.statements.empty());
+}
+TEST(DatabaseBatch, DeleteUsesEveryComponentOfTheCompositePrimaryKey) {
+    FakeDatabase db;
+    db.RegisterTable(pbmysql::test::CompositeRow::default_instance());
+    pbmysql::test::CompositeRow first, second;
+    first.set_realm("r1");
+    first.set_id("1");
+    second.set_realm("r2");
+    second.set_id("1");
+    db.writes = {2};
+    db.BatchDelete({&first, &second});
+    ASSERT_EQ(db.statements.size(), 1u);
+    EXPECT_NE(db.statements[0].sql.find("(`realm`, `id`) IN ((?, ?), (?, ?))"), std::string::npos);
+    EXPECT_EQ(db.statements[0].args, (std::vector<SqlValue>{std::string("r1"), std::string("1"),
+                                                            std::string("r2"), std::string("1")}));
+}
+TEST(DatabaseBatch, FailedLaterDeleteChunkInvalidatesCompletedRows) {
+    FakeDatabase db;
+    MemoryCache cache;
+    db.EnableCache(&cache, 60);
+    std::vector<Row> rows(1001);
+    std::vector<const google::protobuf::Message *> messages;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        rows[i].set_id(i + 1);
+        messages.push_back(&rows[i]);
+    }
+    unsigned writes = 0;
+    db.on_write = [&](const Statement &) {
+        if (++writes == 2)
+            throw MysqlError(1205, "timeout");
+    };
+    db.writes = {1000};
+    EXPECT_THROW(db.BatchDelete(messages), MysqlError);
+    EXPECT_EQ(writes, 2u);
+    EXPECT_EQ(cache.deleted.size(), 1000u);
+}
+TEST(DatabaseVersion, NumericVersionsAndEmptyUpdateRulesMatchGo) {
+    FakeDatabase db;
+    pbmysql::test::NumericVersionRow row;
+    row.set_id(1);
+    row.set_version(0.1f);
+    row.set_label("label");
+    TableOptions options;
+    options.table_name = "numeric_versions";
+    options.primary_keys = StringVector{"id"};
+    db.RegisterTable(row, options);
+    db.writes = {1};
+    EXPECT_TRUE(db.UpdateIfVersion(row, "version"));
+    EXPECT_EQ(std::get<double>(db.statements.back().args.back()), static_cast<double>(0.1f));
+    row.clear_label();
+    EXPECT_THROW(db.UpdateIfVersion(row, "version"), std::invalid_argument);
+    EXPECT_THROW(db.UpdateFieldsIfVersion(row, "version", {}), std::invalid_argument);
+    db.writes = {1};
+    EXPECT_TRUE(db.UpdateFieldsIfVersion(row, "version", {"version"}));
+    EXPECT_THROW(db.DecrByPKIfEnough(Target(), "gold", 0), std::invalid_argument);
+}
+TEST(DatabaseCache, BatchedInvalidationValidatesBeforeDeletingAnything) {
+    FakeDatabase db;
+    MemoryCache cache;
+    db.EnableCache(&cache, 60);
+    auto row = Target();
+    EXPECT_THROW(db.InvalidateCache(std::vector<const google::protobuf::Message *>{&row, nullptr}),
+                 std::invalid_argument);
+    EXPECT_TRUE(cache.deleted.empty());
+    db.InvalidateCache(std::vector<const google::protobuf::Message *>{&row});
+    EXPECT_EQ(cache.deleted.size(), 1u);
+}
+TEST(DatabaseCreate, ConcurrentInsertRemainsADuplicateError) {
+    FakeDatabase db;
+    auto row = Target();
+    db.reads = {std::nullopt};
+    db.on_write = [](const Statement &) { throw MysqlError(1062, "concurrent insert"); };
+    bool created = true;
+    EXPECT_THROW(db.FindOrCreate(row, &created), MysqlError);
+    EXPECT_FALSE(created);
+}
+
+TEST(DatabaseCache, PrimaryKeyChangesInvalidateBothOldAndNewIdentity) {
+    FakeDatabase db;
+    MemoryCache cache;
+    db.EnableCache(&cache, 60);
+    auto row = Target();
+    db.writes = {1};
+    db.UpdateKVByPK(row, "id", uint64_t{2});
+    EXPECT_EQ(cache.deleted, (std::vector<std::string>{"pb:runtime_rows:1", "pb:runtime_rows:2"}));
+    cache.deleted.clear();
+    db.writes = {1};
+    db.IncrByPK(row, "id", 2);
+    EXPECT_EQ(cache.deleted, (std::vector<std::string>{"pb:runtime_rows:1", "pb:runtime_rows:3"}));
+}
+
+TEST(DatabaseQueries, FailedListQueryOrDecodePreservesRowsAndScalarMetadata) {
+    FakeDatabase db;
+    pbmysql::test::RuntimePage page;
+    page.set_total(9);
+    page.add_items()->set_id(77);
+    EXPECT_THROW(db.FindAll(page), std::runtime_error);
+    ASSERT_EQ(page.items_size(), 1);
+    EXPECT_EQ(page.items(0).id(), 77u);
+    EXPECT_EQ(page.total(), 9);
+    db.row_sets = {{{"1", "first", "0", "7", "9", "", std::nullopt},
+                    {"not-an-id", "bad", "0", "7", "9", "", std::nullopt}}};
+    EXPECT_THROW(db.FindAll(page), std::invalid_argument);
+    ASSERT_EQ(page.items_size(), 1);
+    EXPECT_EQ(page.items(0).id(), 77u);
+    EXPECT_EQ(page.total(), 9);
 }
 } // namespace

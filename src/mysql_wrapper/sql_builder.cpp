@@ -58,7 +58,7 @@ void Append(std::vector<SqlValue> &values, const std::vector<SqlValue> &tail) {
 }
 std::string Suffix(const QueryOptions &options) {
     std::string suffix;
-    if (!Trim(options.order_by).empty())
+    if (!options.order_by.empty())
         suffix += " ORDER BY " + options.order_by;
     if (options.limit > 0) {
         suffix += " LIMIT " + std::to_string(options.limit);
@@ -93,6 +93,11 @@ void ValidateNumericValue(const SqlValue &value) {
     }
 }
 } // namespace
+
+std::string NormalizeWhereClause(const std::string &where) {
+    const auto clause = Where(where);
+    return clause.empty() ? "1=1" : clause;
+}
 
 Assign SetCol(std::string c, SqlValue v) {
     return {c, Q(c) + " = ?", {std::move(v)}, false, false};
@@ -140,7 +145,8 @@ StringVector SQLBuilder::Columns(bool exclude_primary) const {
     return columns;
 }
 StringVector SQLBuilder::SetFields(const Message &message, bool exclude_primary) const {
-    table_.ValidateMessage(message);
+    if (message.GetDescriptor() != table_.Descriptor())
+        throw std::invalid_argument("message descriptor mismatch");
     std::vector<const FieldDescriptor *> fields;
     message.GetReflection()->ListFields(message, &fields);
     std::unordered_set<const FieldDescriptor *> set(fields.begin(), fields.end());
@@ -153,7 +159,7 @@ StringVector SQLBuilder::SetFields(const Message &message, bool exclude_primary)
     return columns;
 }
 Statement SQLBuilder::PrimaryKeyWhere(const Message &message) const {
-    table_.ValidateMessage(message);
+    table_.ValidatePrimaryKeyMessage(message);
     if (table_.PrimaryKeys().empty())
         throw std::invalid_argument("primary key not found");
     Statement statement;
@@ -230,11 +236,10 @@ Statement SQLBuilder::BuildAssigns(const std::vector<Assign> &assigns, bool upse
     if (assigns.empty())
         throw std::invalid_argument("empty assignments");
     Statement result;
-    std::unordered_set<std::string> columns;
     for (const auto &assign : assigns) {
         const auto *field = Field(assign.column);
-        if (assign.expression.empty() || !columns.insert(assign.column).second)
-            throw std::invalid_argument("invalid or duplicate assignment: " + assign.column);
+        if (assign.expression.empty())
+            throw std::invalid_argument("invalid assignment: " + assign.column);
         if (assign.numeric && !IsNumericField(field))
             throw std::invalid_argument("numeric assignment requires numeric scalar: " +
                                         assign.column);
@@ -278,6 +283,47 @@ Statement SQLBuilder::UpsertKeepOld(const Message &message) const {
         throw std::invalid_argument("primary key not found");
     return UpsertWith(message, {KeepOld(table_.PrimaryKeys().front())});
 }
+std::vector<Assign> SQLBuilder::IdentityAssigns(const Message *partial) const {
+    if (table_.PrimaryKeys().empty())
+        throw std::invalid_argument("primary key not found");
+    StringVector predicates;
+    for (const auto &key : table_.PrimaryKeys())
+        predicates.push_back(Q(key) + " <=> VALUES(" + Q(key) + ")");
+    const auto identity = Join(predicates, " AND ");
+    std::unordered_set<const FieldDescriptor *> populated;
+    if (partial) {
+        table_.ValidateMessage(*partial);
+        std::vector<const FieldDescriptor *> fields;
+        partial->GetReflection()->ListFields(*partial, &fields);
+        populated.insert(fields.begin(), fields.end());
+    }
+    std::vector<Assign> assignments;
+    for (const auto &column : Columns(true)) {
+        if (partial && !populated.count(Field(column)))
+            continue;
+        if (partial)
+            assignments.push_back(SetColExpr(column, "IF(" + identity + ", ?, " + Q(column) + ")",
+                                             {FieldValue(*partial, Field(column))}));
+        else
+            assignments.push_back(SetColExpr(column, "IF(" + identity + ", VALUES(" + Q(column) +
+                                                         "), " + Q(column) + ")"));
+    }
+    if (assignments.empty())
+        assignments.push_back(KeepOld(table_.PrimaryKeys().front()));
+    return assignments;
+}
+Statement SQLBuilder::GetSaveSQLWithArgs(const Message &message) const {
+    return UpsertWith(message, IdentityAssigns(nullptr));
+}
+Statement SQLBuilder::GetBatchSaveSQLWithArgs(const std::vector<const Message *> &messages) const {
+    return BatchUpsertWith(messages, IdentityAssigns(nullptr));
+}
+Statement SQLBuilder::GetInsertOnDupUpdateSQLWithArgs(const Message &message) const {
+    return UpsertWith(message, IdentityAssigns(&message));
+}
+Statement SQLBuilder::GetInsertOnDupKeyForPrimaryKeyWithArgs(const Message &message) const {
+    return UpsertKeepOld(message);
+}
 Statement SQLBuilder::UpsertWith(const Message &message, const std::vector<Assign> &assigns) const {
     return AppendDuplicate(Insert(message), assigns);
 }
@@ -294,7 +340,7 @@ Statement SQLBuilder::SelectColumns(const StringVector &columns, const std::stri
                                     const std::vector<SqlValue> &args,
                                     const QueryOptions &options) const {
     if (columns.empty())
-        throw std::invalid_argument("empty selected columns");
+        return SelectWhere(where, args, options);
     StringVector quoted;
     for (const auto &column : columns) {
         Field(column);
@@ -302,20 +348,19 @@ Statement SQLBuilder::SelectColumns(const StringVector &columns, const std::stri
     }
     Statement statement{"SELECT " + Join(quoted, ", ") + " FROM " + Q(TableName()), args};
     const auto clause = Where(where);
-    if (!clause.empty())
-        statement.sql += " WHERE " + clause;
+    statement.sql += " WHERE " + (clause.empty() ? "1=1" : clause);
     statement.sql += Suffix(options);
     return statement;
 }
 Statement SQLBuilder::SelectWhere(const std::string &where, const std::vector<SqlValue> &args,
                                   const QueryOptions &options) const {
+    if (table_.Descriptor()->field_count() == 0)
+        throw std::invalid_argument("table has no fields");
     return SelectColumns(Columns(), where, args, options);
 }
 Statement SQLBuilder::SelectByPK(const Message &message) const {
     const auto pk = PrimaryKeyWhere(message);
-    QueryOptions options;
-    options.limit = 1;
-    return SelectWhere(pk.sql, pk.args, options);
+    return SelectWhere(pk.sql, pk.args);
 }
 Statement SQLBuilder::SelectByPKForUpdate(const Message &message) const {
     auto statement = SelectByPK(message);
@@ -326,12 +371,15 @@ SqlValue SQLBuilder::ComparisonValue(const std::string &column, const SqlValue &
     const auto *field = Field(column);
     if (std::holds_alternative<std::nullptr_t>(value))
         return value;
-    std::unique_ptr<Message> temporary(table_.DefaultInstance().New());
-    std::vector<SqlValue> row(table_.Descriptor()->field_count(), nullptr);
-    row[field->index()] = value;
-    ParseRow(*temporary, row);
-    table_.ValidateMessage(*temporary);
-    return FieldComparisonValue(*temporary, field);
+    auto normalized = pbmysql::NormalizeComparisonValue(field, value);
+    if (!field->is_repeated() && field->cpp_type() == FieldDescriptor::CPPTYPE_STRING) {
+        if (const auto *text = std::get_if<std::string>(&value)) {
+            std::unique_ptr<Message> temporary(table_.DefaultInstance().New());
+            temporary->GetReflection()->SetString(temporary.get(), field, *text);
+            table_.ValidateFieldValue(*temporary, field);
+        }
+    }
+    return normalized;
 }
 Statement SQLBuilder::InWhere(const std::string &column,
                               const std::vector<SqlValue> &values) const {
@@ -360,15 +408,13 @@ Statement SQLBuilder::SelectByPKIn(const std::vector<SqlValue> &values,
 Statement SQLBuilder::Count(const std::string &where, const std::vector<SqlValue> &args) const {
     Statement statement{"SELECT COUNT(*) FROM " + Q(TableName()), args};
     const auto clause = Where(where);
-    if (!clause.empty())
-        statement.sql += " WHERE " + clause;
+    statement.sql += " WHERE " + (clause.empty() ? "1=1" : clause);
     return statement;
 }
 Statement SQLBuilder::Exists(const std::string &where, const std::vector<SqlValue> &args) const {
     Statement statement{"SELECT 1 FROM " + Q(TableName()), args};
     const auto clause = Where(where);
-    if (!clause.empty())
-        statement.sql += " WHERE " + clause;
+    statement.sql += " WHERE " + (clause.empty() ? "1=1" : clause);
     statement.sql += " LIMIT 1";
     return statement;
 }
@@ -394,14 +440,17 @@ Statement SQLBuilder::UpdateAssignsByPK(const Message &message,
     return UpdateAssignsWhere(assigns, pk.sql, pk.args);
 }
 Statement SQLBuilder::UpdateFieldsByPK(const Message &message, const StringVector &columns) const {
-    table_.ValidateMessage(message);
+    if (message.GetDescriptor() != table_.Descriptor())
+        throw std::invalid_argument("message descriptor mismatch");
     std::vector<Assign> assigns;
-    for (const auto &column : columns)
+    for (const auto &column : columns) {
+        table_.ValidateFieldValue(message, Field(column));
         assigns.push_back(SetCol(column, FieldValue(message, Field(column))));
+    }
     return UpdateAssignsByPK(message, assigns);
 }
 Statement SQLBuilder::UpdateByPK(const Message &message) const {
-    return UpdateFieldsByPK(message, SetFields(message, true));
+    return UpdateFieldsByPK(message, SetFields(message, false));
 }
 Statement SQLBuilder::UpdateByPKIf(const Message &message, const std::string &guard,
                                    const std::vector<SqlValue> &args) const {
@@ -409,7 +458,7 @@ Statement SQLBuilder::UpdateByPKIf(const Message &message, const std::string &gu
     auto where_args = pk.args;
     Append(where_args, args);
     std::vector<Assign> assigns;
-    for (const auto &column : SetFields(message, true))
+    for (const auto &column : SetFields(message, false))
         assigns.push_back(SetCol(column, FieldValue(message, Field(column))));
     return UpdateAssignsWhere(assigns, Guard(pk.sql, guard), where_args);
 }
@@ -426,8 +475,8 @@ Statement SQLBuilder::IncrByPK(const Message &message, const std::string &column
 }
 Statement SQLBuilder::DecrByPKIfEnough(const Message &message, const std::string &column,
                                        int64_t delta) const {
-    if (delta < 0)
-        throw std::invalid_argument("decrement delta must be nonnegative");
+    if (delta <= 0)
+        throw std::invalid_argument("decrement delta must be positive");
     auto pk = PrimaryKeyWhere(message);
     pk.sql += " AND " + Q(column) + " >= ?";
     pk.args.push_back(delta);
@@ -452,7 +501,7 @@ Statement SQLBuilder::DeleteWhereLimit(const std::string &where, const std::vect
     if (limit <= 0)
         throw std::invalid_argument("delete limit must be positive");
     auto statement = DeleteWhere(where, args);
-    if (!Trim(order_by).empty())
+    if (!order_by.empty())
         statement.sql += " ORDER BY " + order_by;
     statement.sql += " LIMIT " + std::to_string(limit);
     return statement;

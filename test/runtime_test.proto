@@ -16,6 +16,16 @@ message RuntimeRow {
   optional int32 explicit_zero = 7;
 }
 message RuntimeRows { repeated RuntimeRow items = 1; }
+message RuntimePage {
+  int64 total = 1;
+  repeated RuntimeRow items = 2;
+  string continuation = 3;
+}
+message NumericVersionRow {
+  uint64 id = 1;
+  float version = 2;
+  string label = 3;
+}
 message CollectionRow {
   option (proto2mysql.table_name) = "collection_rows";
   option (proto2mysql.primary_key) = "id";

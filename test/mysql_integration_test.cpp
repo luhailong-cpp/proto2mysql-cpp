@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <gtest/gtest.h>
 #include <thread>
 
@@ -213,5 +214,178 @@ TEST_F(MysqlIntegration, OnlineMigrationPreservesRenamedDataAndRejectsUnsafeDrif
     loaded.set_id(1);
     ASSERT_TRUE(db.FindOneByPrimaryKey(loaded));
     EXPECT_EQ(loaded.data(), row.data());
+}
+
+TEST_F(MysqlIntegration, TypedQueriesPaginationAndSingleRowCardinalityMatchGo) {
+    auto first = Target(9007199254740992ULL), second = Target(9007199254740993ULL);
+    db.BatchInsert({&first, &second});
+    Row loaded;
+    ASSERT_TRUE(db.FindOneByKV(loaded, "id", std::to_string(second.id())));
+    EXPECT_EQ(loaded.id(), second.id());
+    pbmysql::test::RuntimePage page;
+    page.set_total(99);
+    page.set_continuation("keep");
+    db.FindPageByCursor(page, "WHERE `gold` >= ?", {uint64_t{0}}, "id",
+                        SqlValue{std::to_string(first.id())}, 10);
+    ASSERT_EQ(page.items_size(), 1);
+    EXPECT_EQ(page.items(0).id(), second.id());
+    EXPECT_EQ(page.total(), 99);
+    EXPECT_EQ(page.continuation(), "keep");
+    EXPECT_EQ(db.CountByWhereWithArgs(page, "`id` >= ?", {first.id()}), 2);
+    EXPECT_TRUE(db.Exists(page, "`id` = ?", {second.id()}));
+    EXPECT_THROW(db.FindOneByWhereWithArgs(loaded, "`gold` >= ?", {uint64_t{0}}),
+                 MultipleRowsError);
+    QueryOptions options;
+    options.order_by = "`id` DESC";
+    options.offset = 100;
+    ASSERT_TRUE(db.FindOneWithOptions(loaded, "", {}, options));
+    EXPECT_EQ(loaded.id(), second.id());
+    db.BatchDelete({&first, &second});
+    EXPECT_EQ(db.Count(page), 0);
+    const auto canonical = db.DbName();
+    EXPECT_THROW(db.SetDbName("wrong_database"), std::invalid_argument);
+    EXPECT_EQ(db.DbName(), canonical);
+}
+TEST_F(MysqlIntegration, OldWriterPreservesColumnsOnlyKnownToNewerDescriptor) {
+    auto row = Target();
+    db.Save(row);
+    google::protobuf::FileDescriptorSet files;
+    Row::descriptor()->file()->CopyTo(files.add_file());
+    auto *added = files.mutable_file(0)->mutable_message_type(0)->add_field();
+    added->set_name("new_counter");
+    added->set_number(100);
+    added->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+    added->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+    auto source = std::make_shared<DescriptorSet>(files);
+    auto newer = source->NewMessage("pbmysql.test.RuntimeRow");
+    Database newer_db;
+    newer_db.Connect(Env("PBMYSQL_TEST_HOST", "127.0.0.1"), Env("PBMYSQL_TEST_USER", "root"),
+                     Env("PBMYSQL_TEST_PASSWORD", ""),
+                     Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
+                     static_cast<unsigned>(std::stoul(Env("PBMYSQL_TEST_PORT", "3306"))));
+    newer_db.RegisterTable(*newer, options);
+    newer_db.CreateOrUpdateTable(*newer);
+    const auto *fields = newer->GetDescriptor();
+    const auto *reflection = newer->GetReflection();
+    reflection->SetUInt64(newer.get(), fields->FindFieldByName("id"), row.id());
+    reflection->SetString(newer.get(), fields->FindFieldByName("email"), row.email());
+    reflection->SetUInt64(newer.get(), fields->FindFieldByName("new_counter"), 123456789);
+    newer_db.Save(*newer);
+    row.set_gold(77);
+    db.Save(row);
+    ASSERT_TRUE(newer_db.FindOneByPK(*newer));
+    EXPECT_EQ(reflection->GetUInt64(*newer, fields->FindFieldByName("new_counter")), 123456789u);
+    EXPECT_EQ(reflection->GetUInt64(*newer, fields->FindFieldByName("gold")), 77u);
+}
+
+TEST_F(MysqlIntegration, SharedClusterUsesCurrentReadsAcrossTwoDatabaseNodes) {
+    const char *second_host = std::getenv("PBMYSQL_TEST_HOST2");
+    if (!second_host)
+        GTEST_SKIP() << "set PBMYSQL_TEST_HOST2 to run cross-node cluster verification";
+    Database second;
+    second.Connect(second_host, Env("PBMYSQL_TEST_USER", "root"), Env("PBMYSQL_TEST_PASSWORD", ""),
+                   Env("PBMYSQL_TEST_DATABASE", "proto2mysql_test"),
+                   static_cast<unsigned>(std::stoul(Env("PBMYSQL_TEST_PORT2", "3306"))));
+    second.RegisterTable(Row::default_instance(), options);
+    auto row = Target();
+    row.set_epoch(2);
+    row.set_seq(1);
+    row.set_gold(21);
+    ASSERT_TRUE(second.SaveConditional(row, {{"epoch", "seq"}, false, {}}).Applied());
+    auto replay = row;
+    replay.set_epoch(1);
+    replay.set_seq(999);
+    replay.set_gold(999);
+    auto result = db.SaveConditional(replay, {{"epoch", "seq"}, false, {}});
+    EXPECT_EQ(result.outcome, SaveOutcome::Rejected);
+    EXPECT_EQ(result.stored, (std::vector<uint64_t>{2, 1}));
+    Row current;
+    current.set_id(row.id());
+    const auto committed = db.Transaction([&](Database &tx) {
+        EXPECT_TRUE(tx.FindOneByPK(current));
+        auto latest = row;
+        latest.set_epoch(3);
+        latest.set_gold(31);
+        EXPECT_TRUE(second.SaveConditional(latest, {{"epoch", "seq"}, false, {}}).Applied());
+        auto old = row;
+        old.set_seq(888);
+        const auto rejected = tx.SaveConditional(old, {{"epoch", "seq"}, false, {}});
+        EXPECT_EQ(rejected.outcome, SaveOutcome::Rejected);
+        EXPECT_EQ(rejected.stored, (std::vector<uint64_t>{3, 1}));
+        return true;
+    });
+    EXPECT_TRUE(committed);
+    current.Clear();
+    current.set_id(row.id());
+    ASSERT_TRUE(db.FindOneByPK(current));
+    EXPECT_EQ(current.epoch(), 3u);
+    EXPECT_EQ(current.gold(), 31u);
+}
+
+TEST_F(MysqlIntegration, OneDatabaseInstanceSerializesConcurrentOperationsAndResults) {
+    auto seed = Target();
+    db.Save(seed);
+    std::atomic<unsigned> failures{0};
+    auto increment = [&] {
+        try {
+            Row key;
+            key.set_id(seed.id());
+            for (unsigned i = 0; i < 12; ++i)
+                db.IncrByPK(key, "gold", 1);
+        } catch (...) {
+            ++failures;
+        }
+    };
+    std::vector<std::thread> workers;
+    for (unsigned i = 0; i < 6; ++i)
+        workers.emplace_back(increment);
+    for (auto &worker : workers)
+        worker.join();
+    ASSERT_EQ(failures, 0u);
+    Row current;
+    current.set_id(seed.id());
+    ASSERT_TRUE(db.FindOneByPK(current));
+    EXPECT_EQ(current.gold(), 72u);
+    workers.clear();
+    for (unsigned i = 0; i < 6; ++i)
+        workers.emplace_back([&, i] {
+            try {
+                auto row = Target(100 + i);
+                const auto result = db.ExecuteStatement(db.Builder(row).Insert(row));
+                if (result.affected_rows != 1)
+                    ++failures;
+            } catch (...) {
+                ++failures;
+            }
+        });
+    for (auto &worker : workers)
+        worker.join();
+    EXPECT_EQ(failures, 0u);
+    EXPECT_EQ(db.Count(current), 7);
+}
+TEST_F(MysqlIntegration, SharedConnectionCannotJoinAnotherThreadsUncommittedTransaction) {
+    auto row = Target();
+    db.Save(row);
+    std::promise<void> attempted;
+    auto attempted_future = attempted.get_future();
+    std::future<void> worker;
+    const auto committed = db.Transaction([&](Database &transaction) {
+        auto changed = row;
+        changed.set_gold(100);
+        transaction.Save(changed);
+        worker = std::async(std::launch::async, [&] {
+            attempted.set_value();
+            db.IncrByPK(row, "gold", 1);
+        });
+        attempted_future.wait();
+        EXPECT_EQ(worker.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+        return false;
+    });
+    EXPECT_FALSE(committed);
+    worker.get();
+    Row current;
+    current.set_id(row.id());
+    ASSERT_TRUE(db.FindOneByPK(current));
+    EXPECT_EQ(current.gold(), 1u);
 }
 } // namespace

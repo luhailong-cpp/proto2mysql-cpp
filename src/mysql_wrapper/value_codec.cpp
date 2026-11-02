@@ -30,18 +30,74 @@ bool IsTimestamp(const FieldDescriptor *f) {
 }
 template <class T> T Integer(const std::string &text) {
     T value{};
-    auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    const char *start = text.data();
+    if constexpr (std::is_signed_v<T>)
+        if (!text.empty() && text.front() == '+')
+            ++start;
+    auto result = std::from_chars(start, text.data() + text.size(), value);
     if (result.ec != std::errc{} || result.ptr != text.data() + text.size())
         throw std::invalid_argument("invalid or out-of-range integer value");
     return value;
 }
 double Floating(const std::string &text) {
     double value{};
-    auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    const char *start = text.data();
+    if (!text.empty() && text.front() == '+')
+        ++start;
+    auto result = std::from_chars(start, text.data() + text.size(), value);
     if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
         !std::isfinite(value))
         throw std::invalid_argument("invalid or non-finite floating-point value");
     return value;
+}
+bool Boolean(const std::string &text) {
+    if (text == "1" || text == "t" || text == "T" || text == "true" || text == "TRUE" ||
+        text == "True")
+        return true;
+    if (text == "0" || text == "f" || text == "F" || text == "false" || text == "FALSE" ||
+        text == "False")
+        return false;
+    throw std::invalid_argument("invalid bool value");
+}
+void SetDefault(Message &message, const FieldDescriptor *field) {
+    const auto *r = message.GetReflection();
+    if (field->is_repeated() || field->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
+        r->ClearField(&message, field);
+        return;
+    }
+    switch (field->type()) {
+    case FieldDescriptor::TYPE_INT32:
+        r->SetInt32(&message, field, field->default_value_int32());
+        break;
+    case FieldDescriptor::TYPE_INT64:
+        r->SetInt64(&message, field, field->default_value_int64());
+        break;
+    case FieldDescriptor::TYPE_UINT32:
+        r->SetUInt32(&message, field, field->default_value_uint32());
+        break;
+    case FieldDescriptor::TYPE_UINT64:
+        r->SetUInt64(&message, field, field->default_value_uint64());
+        break;
+    case FieldDescriptor::TYPE_FLOAT:
+        r->SetFloat(&message, field, field->default_value_float());
+        break;
+    case FieldDescriptor::TYPE_DOUBLE:
+        r->SetDouble(&message, field, field->default_value_double());
+        break;
+    case FieldDescriptor::TYPE_BOOL:
+        r->SetBool(&message, field, field->default_value_bool());
+        break;
+    case FieldDescriptor::TYPE_ENUM:
+        r->SetEnumValue(&message, field, field->default_value_enum()->number());
+        break;
+    case FieldDescriptor::TYPE_STRING:
+    case FieldDescriptor::TYPE_BYTES:
+        r->SetString(&message, field, std::string(field->default_value_string()));
+        break;
+    default:
+        throw std::invalid_argument("unsupported protobuf field kind: " +
+                                    std::string(field->name()));
+    }
 }
 std::string SerializeChecked(const Message &message) {
     std::string data;
@@ -120,6 +176,8 @@ SqlValue FieldValue(const Message &message, const FieldDescriptor *field) {
         const auto *r = stamp.GetReflection();
         const auto seconds = r->GetInt64(stamp, d->FindFieldByName("seconds"));
         const auto nanos = r->GetInt32(stamp, d->FindFieldByName("nanos"));
+        if (seconds == -62135596800LL && nanos == 0)
+            return nullptr;
         if (seconds < -30610224000LL || seconds > 253402300799LL || nanos < 0 || nanos > 999999999)
             throw std::invalid_argument("Timestamp is outside MySQL DATETIME range");
         google::protobuf::Timestamp ts;
@@ -183,6 +241,66 @@ SqlValue FieldComparisonValue(const Message &message, const FieldDescriptor *fie
     return value;
 }
 
+SqlValue NormalizeComparisonValue(const FieldDescriptor *field, const SqlValue &value) {
+    if (!field)
+        throw std::invalid_argument("null field descriptor");
+    if (std::holds_alternative<std::nullptr_t>(value) || field->is_repeated())
+        return value;
+    const auto *text = std::get_if<std::string>(&value);
+    switch (field->type()) {
+    case FieldDescriptor::TYPE_INT32:
+        if (text)
+            return int64_t(Integer<int32_t>(*text));
+        break;
+    case FieldDescriptor::TYPE_INT64:
+        if (text)
+            return Integer<int64_t>(*text);
+        break;
+    case FieldDescriptor::TYPE_UINT32:
+        if (text)
+            return uint64_t(Integer<uint32_t>(*text));
+        break;
+    case FieldDescriptor::TYPE_UINT64:
+        if (text)
+            return Integer<uint64_t>(*text);
+        break;
+    case FieldDescriptor::TYPE_ENUM:
+        if (text)
+            return int64_t(Integer<int32_t>(*text));
+        break;
+    case FieldDescriptor::TYPE_BOOL:
+        if (text)
+            return int64_t(Boolean(*text));
+        break;
+    case FieldDescriptor::TYPE_FLOAT: {
+        const double number =
+            text ? Floating(*text)
+                 : std::visit(
+                       [](const auto &v) -> double {
+                           using T = std::decay_t<decltype(v)>;
+                           if constexpr (std::is_arithmetic_v<T>)
+                               return static_cast<double>(v);
+                           else
+                               throw std::invalid_argument("invalid float comparison value");
+                       },
+                       value);
+        const float rounded = static_cast<float>(number);
+        if (!std::isfinite(rounded))
+            throw std::invalid_argument("non-finite float comparison value");
+        return static_cast<double>(rounded);
+    }
+    case FieldDescriptor::TYPE_DOUBLE:
+        if (text)
+            return Floating(*text);
+        break;
+    default:
+        return value; // Opaque BLOB and DATETIME predicates preserve exact supplied bytes.
+    }
+    if (const auto *number = std::get_if<double>(&value); number && !std::isfinite(*number))
+        throw std::invalid_argument("non-finite comparison value");
+    return value;
+}
+
 void ParseRow(Message &message, const std::vector<SqlValue> &row) {
     const auto *descriptor = message.GetDescriptor();
     if (row.size() != static_cast<size_t>(descriptor->field_count()))
@@ -192,9 +310,15 @@ void ParseRow(Message &message, const std::vector<SqlValue> &row) {
     for (int i = 0; i < descriptor->field_count(); ++i) {
         const auto *field = descriptor->field(i);
         ValidateField(*parsed, field);
-        if (std::holds_alternative<std::nullptr_t>(row[i]))
+        if (std::holds_alternative<std::nullptr_t>(row[i])) {
+            SetDefault(*parsed, field);
             continue;
+        }
         const std::string text = ValueText(row[i]);
+        if (text.empty()) {
+            SetDefault(*parsed, field);
+            continue;
+        }
         if (field->is_repeated()) {
             std::unique_ptr<Message> holder(message.New());
             if (!holder->ParseFromString(text))
@@ -203,10 +327,12 @@ void ParseRow(Message &message, const std::vector<SqlValue> &row) {
             reflection->SwapFields(parsed.get(), holder.get(), {field});
         } else if (IsTimestamp(field)) {
             std::string iso = text;
-            if (iso.size() < 19 || iso[10] != ' ')
-                throw std::invalid_argument("invalid DATETIME value");
-            iso[10] = 'T';
-            iso += 'Z';
+            if (iso.size() == 10)
+                iso += "T00:00:00Z";
+            else if (iso.size() >= 19 && iso[10] == ' ') {
+                iso[10] = 'T';
+                iso += 'Z';
+            }
             google::protobuf::Timestamp ts;
             if (!google::protobuf::util::TimeUtil::FromString(iso, &ts))
                 throw std::invalid_argument("invalid DATETIME value");
@@ -231,9 +357,7 @@ void ParseRow(Message &message, const std::vector<SqlValue> &row) {
                 reflection->SetUInt64(parsed.get(), field, Integer<uint64_t>(text));
                 break;
             case FieldDescriptor::TYPE_BOOL:
-                if (text != "0" && text != "1" && text != "true" && text != "false")
-                    throw std::invalid_argument("invalid bool value");
-                reflection->SetBool(parsed.get(), field, text == "1" || text == "true");
+                reflection->SetBool(parsed.get(), field, Boolean(text));
                 break;
             case FieldDescriptor::TYPE_ENUM:
                 reflection->SetEnumValue(parsed.get(), field, Integer<int32_t>(text));

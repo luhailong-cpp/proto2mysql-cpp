@@ -1,0 +1,51 @@
+# Disposable integration databases. Stop with:
+# docker compose -f test/docker-compose.yml down
+name: proto2mysql-test
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: proto2mysql_test
+      MYSQL_DATABASE: proto2mysql_test
+      MYSQL_ROOT_HOST: '%'
+    ports: ['127.0.0.1:${PBMYSQL_TEST_MYSQL_PORT:-33384}:3306']
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '--silent']
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  tidb:
+    image: pingcap/tidb:v8.5.2
+    command: ['--store=unistore', '--path=/tmp/tidb', '-P', '4000']
+    ports: ['127.0.0.1:${PBMYSQL_TEST_TIDB_PORT:-33400}:4000']
+  pd:
+    image: pingcap/pd:v8.5.2
+    mem_limit: 512m
+    command:
+      - --name=pd0
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd0=http://pd:2380
+  tikv:
+    image: pingcap/tikv:v8.5.2
+    mem_limit: 3g
+    memswap_limit: 6g
+    cpus: 2
+    command: ['--addr=0.0.0.0:20160', '--advertise-addr=tikv:20160', '--pd=pd:2379']
+    depends_on: [pd]
+  tidb0:
+    image: pingcap/tidb:v8.5.2
+    mem_limit: 1536m
+    cpus: 2
+    command: ['--store=tikv', '--path=pd:2379', '--advertise-address=tidb0']
+    ports: ['127.0.0.1:${PBMYSQL_TEST_TIDB0_PORT:-33401}:4000']
+    depends_on: [tikv]
+  tidb1:
+    image: pingcap/tidb:v8.5.2
+    mem_limit: 1536m
+    cpus: 2
+    command: ['--store=tikv', '--path=pd:2379', '--advertise-address=tidb1']
+    ports: ['127.0.0.1:${PBMYSQL_TEST_TIDB1_PORT:-33402}:4000']
+    depends_on: [tikv]

@@ -88,11 +88,11 @@ db.Transaction([&](pbmysql::Database& tx) {
 });
 ```
 
-`Database` 持有一个连接。每个并发工作线程使用独立实例，不要共享同一连接并发调用；不要在 `Transaction` 回调内手动执行事务控制 SQL。自动重连被关闭，避免断线后事务悄悄消失。数据库错误抛 `MysqlError`（`value()` 保留原 MySQL 错误码），参数错误抛 `std::invalid_argument`，状态错误抛 `std::logic_error`。
+`Database` 持有一个连接，并串行保护同一实例的数据库操作、事务和缓存状态，允许多个线程安全调用。需要 SQL 并行吞吐时使用独立实例。事务回调独占该实例的连接，不能将同一实例交给其他线程后在回调内等待它们；不要手动执行事务控制 SQL。原始 `MysqlClient` 仍由调用方同步。自动重连被关闭，避免断线后事务悄悄消失。数据库错误抛 `MysqlError`（`value()` 保留原 MySQL 错误码），参数错误抛 `std::invalid_argument`，状态错误抛 `std::logic_error`。
 
 `Save` 按**完整主键**先整行 UPDATE、缺失时 INSERT；仅写本描述符认识的列，零值照写。备用唯一键冲突抛 1062，不能更新另一条记录。`InsertOnDupUpdate` 是 `Save` 的历史别名；需要显式的 MySQL ODKU 时使用下面的 `SQLBuilder::Upsert`。`InsertIgnore` 仅把 1062 转成 `false`，其他错误继续抛出。批量操作在显式事务外不保证原子性。
 
-`Update` 只写已赋值的非主键字段。proto3 隐式标量零值不会出现在该集合中；清零应使用 `optional` 或 `UpdateFieldsByPrimaryKey`。列表查询要求输出消息恰好有一个对应类型的 repeated message 字段。
+`Update` 只写已赋值的非主键字段。proto3 隐式标量零值不会出现在该集合中；清零应使用 `optional` 或 `UpdateFieldsByPrimaryKey`。列表查询通过反射推导元素类型，输出消息要求恰好有一个 repeated message 字段，允许额外标量元数据；旧显式模板接口保留。普通单行查询多命中会报错，只有 FindOneWithOptions 明确取第一行。
 
 ## 条件保存
 
@@ -120,7 +120,7 @@ pbmysql::SQLBuilder b(Player::default_instance()); // 无需连接或注册
 // 也可：auto b = db.Builder(row); // 复用注册时的配置
 auto stmt = b.UpsertAdd(row, {"gold"});
 // stmt.sql 含 ?；stmt.args 是 variant<nullptr_t,int64_t,uint64_t,double,string>
-db.Execute(stmt); // prepared statement；string 保留二进制长度
+auto result = db.ExecuteStatement(stmt); // prepared statement；返回本次 affected_rows/last_insert_id
 ```
 
 | 分类 | 接口 |
@@ -135,7 +135,7 @@ db.Execute(stmt); // prepared statement；string 保留二进制长度
 | 删除 | DeleteByPK / DeleteByPKIf / DeleteWhere / DeleteWhereLimit / DeleteByKVIn / DeleteByPKIn |
 | 赋值 | SetCol / AddCol / SubCol / SetColExpr / SetNew / AddNew / MinNew / MaxNew / SetNewIfZero / KeepOld |
 
-字段名必须存在于消息里，统一引用。UPDATE/DELETE 的空条件、空 IN、重复赋值和非数值列的数值运算在发 SQL 前被拒绝。`where`、`order_by`、guard 和表达式是调用方提供的可信 SQL 片段；业务取值必须放入 `args`。DML 不带末尾分号。`Database` 的旧 Where 方法继续接受常量条件，业务参数用新增 `*ByWhereWithArgs`。直接 `Execute` builder 语句属于底层接口，缓存失效由调用者负责。
+字段名必须存在于消息里，统一引用。UPDATE/DELETE 的空条件、空 IN 和非数值列的数值运算在发 SQL 前被拒绝；重复 Assign 保留 MySQL 的顺序赋值语义。`where`、`order_by`、guard 和表达式是调用方提供的可信 SQL 片段；业务取值必须放入 `args`。DML 不带末尾分号。`Database` 的旧 Where 方法继续接受常量条件，业务参数用新增 `*ByWhereWithArgs`。直接 `Execute` builder 语句属于底层接口，缓存失效由调用者负责。
 
 `QueryOptions` 支持 `order_by`、`limit`、`offset`、`for_update`；应用需要排序稳定时应显式指定 ORDER BY。FOR UPDATE 必须放在事务内才能持续持锁。
 
@@ -146,11 +146,11 @@ db.Execute(stmt); // prepared statement；string 保留二进制长度
 - Timestamp → UTC DATETIME(6)，缺失值为 NULL；读取会清除旧字段，解析失败保留调用方原消息。
 - 主键/唯一键里的 string → VARCHAR(N) + utf8mb4_0900_bin，bytes → VARBINARY(N)，默认 N=191，完整索引，验证 UTF-8、长度与 3072B 索引预算。字符串键需要支持该排序规则的 MySQL 8.0+ 或相应 TiDB；MariaDB 客户端库可连接 MySQL，但这里不承诺 MariaDB 服务端兼容。
 - 建表写入 `COMMENT 'pb:N'`。迁移按同名列或字段号识别改名，不删列、不收窄已有更宽类型；signed/unsigned、NULL、DEFAULT、自增、键列排序规则和声明索引冲突会先拒绝，再由业务显式迁移。
-- 缺失列/二级索引可以补齐；未声明的已有列/索引保留。`MessageTable::SetExpandOnly(true)` 限制为新增结构，禁止改名和修改已有列。
+- 缺失列/二级索引可以补齐；未声明的已有列/索引保留。`Database::SetExpandOnly(true)` / `MessageTable::SetExpandOnly(true)` 限制为新增结构，禁止改名和修改已有列。
 - 支持 TiDB NONCLUSTERED、SHARD_ROW_ID_BITS、PRE_SPLIT_REGIONS、AUTO_ID_CACHE=1 扩展注释。
-- `GenerateMigrationSql` 可先检查 SQL；`CreateOrUpdateTable` 用 session advisory lock 串行化本库的 schema 写入，要求后端支持 GET_LOCK/RELEASE_LOCK。释放锁状态不明时会关闭连接，避免遗留持锁会话。DDL 会隐式提交，因此事务内拒绝运行 schema 同步。
+- `GenerateMigrationSql` 可先检查 SQL；`CreateOrUpdateTable` 用 session advisory lock 串行化本库的 schema 写入，使用与 Go 相同的库级锁名，仅在后端明确不支持 GET_LOCK 时有提示地降级。释放锁状态不明时会关闭连接，避免遗留持锁会话。DDL 会隐式提交，因此事务内拒绝运行 schema 同步。
 
-旧 C++ string/bytes 列与当前映射可能不同；同步发现不安全差异会报错。部署前使用迁移 SQL 和备份核对数据。旧 TEXT 前缀唯一键或不区分大小写的键列须显式迁移，C++ 版不生成 Go 版完整的影子表重建指导。
+旧 C++ string/bytes 列与当前映射可能不同；同步发现不安全差异会报错。部署前使用迁移 SQL 和备份核对数据。旧 TEXT 前缀唯一键或不区分大小写的键列会返回 SchemaError(MigrationReport)：包括只读核对 SQL、原地迁移或影子表方案、额外索引和自增水位保留，以及外键/触发器/孤儿列提示。普通同步不会自动执行这些手工迁移方案。
 
 ## 缓存
 
@@ -166,12 +166,18 @@ protoc -I proto -I your-protos --include_imports \
 ./build/proto2sql --descriptor-set schema.pb --out schema.sql
 ```
 
-扫描 db=true 文件中的现代 table_name 消息（含嵌套类型），以及旧 OptionTableName 消息；输出确定顺序的建表 SQL。输出前完成所有配置校验，错误返回非零退出码。运行时也提供 `WriteCreateTableSql`、`DumpCreateTableSqlFile`、`WriteMigrationSql` 与 `DumpMigrationSqlFile`。
+源文件工作流也可使用 `proto2sql -proto a.proto,b.proto -I ./proto -out ./sql`；`-single schema.sql` 合并，`-drop` 显式导出 DROP 警告。descriptor 模式兼容原命令。完整校验后分阶段写入，失败恢复已有输出，支持 Windows UTF-8 文件路径。选项和兼容行为见 [工具对照](docs/api-parity.md#proto2sql)。运行时也提供 `WriteCreateTableSql`、`DumpCreateTableSqlFile`、`WriteMigrationSql` 与 `DumpMigrationSqlFile`。
 
-## 与 Go 的接口边界
+## 自动注册与 CMake 接入
 
-数据库行为与 SQLBuilder 按当前 Go 版对齐，C++ 的连接管理、异常和容器采用原生接口。Go 特有的 GORM、context 取消以及全局描述符自动枚举没有移植；C++ 自动注册显式接收 FileDescriptor，离线工具接收 descriptor set。字符串键的人工迁移方案、TiDB 集群行为需要在目标环境另行核对。
+```cmake
+find_package(proto2mysql CONFIG REQUIRED)
+add_executable(game main.cpp)
+pbmysql_generate_cpp(game PROTOS player.proto IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+```
 
-## 本次验证
+该 helper 支持 executable/static 目标；shared/module 目标在配置时明确拒绝，请在最终 executable 或 static 目标上调用。生成的 protobuf 与文件登记会链接进目标，包括静态库消费者。随后调用 `db.RegisterAllTables()` 即可扫描文件和依赖中的全部 db/table 消息，无需逐表注册。已有生成流程可用 `PBMYSQL_REGISTER_PROTO_FILE(Player)` 一次登记根文件；运行时 descriptor set 使用 `db.RegisterDescriptorSet("schema.pb")`，DB 保留动态来源。纯动态消息/离线构造的原始 protobuf descriptor 仍应遵守 protobuf 的 factory 生命周期。
 
-Linux 容器内，GCC 13.4 / CMake 3.25 / MySQL 8.4.13：Protobuf 3.21.12 + C++17 与 Protobuf 35.1 + C++20 均为 61/61 测试通过，包含真实 MySQL 的并发栅栏、唯一键冲突、事务回滚、二进制读写、在线迁移以及离线 CLI。Release 的无测试构建和安装通过。原生 Windows 编译和 TiDB 集群未实测。
+数据库便利接口统一使用 PK/KV 拼写，保留旧长名别名。参数化分页、聚合、typed KV/IN、无模板列表查询及完整复合主键批量删除已补齐。同一实例的操作和事务通过连接级互斥保护，多实例可并行；Tables()/tables() 的可变兼容引用仅用于初始化或调用方外部同步。注册配置、DDL、缓存后端不能在事务内替换。Go 专用 GORM/context 取消框架已按要求排除，不列为未完成项。
+
+逐项数据库行为和错误语义见 [运行时对照](docs/runtime-parity.md)，SQLBuilder、codec、CLI 见 [API 对照](docs/api-parity.md)，完整实测矩阵见 [验证记录](docs/verification.md)。

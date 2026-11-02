@@ -9,6 +9,7 @@ jobs:
         env:
           MYSQL_ROOT_PASSWORD: proto2mysql_test
           MYSQL_DATABASE: proto2mysql_test
+          MYSQL_ROOT_HOST: '%'
         ports:
           - 3306:3306
         options: >-
@@ -24,7 +25,48 @@ jobs:
       PBMYSQL_TEST_DATABASE: proto2mysql_test
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libprotobuf-dev protobuf-compiler default-libmysqlclient-dev libgtest-dev
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libprotobuf-dev protobuf-compiler default-libmysqlclient-dev default-mysql-client libgtest-dev
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
       - run: cmake --build build
-      - run: ctest --test-dir build --output-on-failure
+      - name: MySQL 8.4 tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Install and test downstream auto-registration
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/pbmysql"
+          cmake -S test/cmake_consumer -B build-consumer -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/pbmysql"
+          cmake --build build-consumer
+          ctest --test-dir build-consumer --output-on-failure
+      - name: TiDB single-node tests
+        env:
+          PBMYSQL_TEST_PORT: 33400
+          PBMYSQL_TEST_PASSWORD: ''
+        run: |
+          docker compose -f test/docker-compose.yml up -d tidb
+          ready=0
+          for attempt in $(seq 1 90); do
+            if mysql --protocol=TCP -h127.0.0.1 -P33400 -uroot -e 'CREATE DATABASE IF NOT EXISTS proto2mysql_test'; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1
+          ctest --test-dir build --output-on-failure
+          docker compose -f test/docker-compose.yml stop tidb
+      - name: TiDB two-node cluster tests
+        env:
+          PBMYSQL_TEST_PORT: 33401
+          PBMYSQL_TEST_PASSWORD: ''
+          PBMYSQL_TEST_HOST2: 127.0.0.1
+          PBMYSQL_TEST_PORT2: 33402
+        run: |
+          docker compose -f test/docker-compose.yml up -d pd tikv tidb0 tidb1
+          for port in 33401 33402; do
+            ready=0
+            for attempt in $(seq 1 120); do
+              if mysql --protocol=TCP -h127.0.0.1 -P"$port" -uroot -e 'CREATE DATABASE IF NOT EXISTS proto2mysql_test'; then ready=1; break; fi
+              sleep 2
+            done
+            test "$ready" = 1
+          done
+          ctest --test-dir build --output-on-failure
+      - name: Stop disposable TiDB databases
+        if: always()
+        run: docker compose -f test/docker-compose.yml down

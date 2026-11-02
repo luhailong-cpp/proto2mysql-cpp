@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/message.h"
 #include "src/mysql_wrapper/mysql_result.h"
+#include "src/mysql_wrapper/schema_migration.h"
 
 namespace pbmysql {
 
@@ -89,11 +91,16 @@ class MessageTable {
         std::optional<std::string> default_value;
         std::string extra;
         std::string collation;
+        std::string charset;
     };
     using ColumnMap = std::unordered_map<std::string, ColumnMeta>;
 
     explicit MessageTable(const ::google::protobuf::Message &default_instance,
                           const TableOptions &overrides = {});
+    MessageTable(const MessageTable &) = default;
+    MessageTable(MessageTable &&) = default;
+    MessageTable &operator=(const MessageTable &);
+    MessageTable &operator=(MessageTable &&);
 
     void SetAutoIncrement(uint64_t auto_increment) { auto_increment_ = auto_increment; }
     void SetDbName(const std::string &db_name) { db_name_ = db_name; }
@@ -105,6 +112,9 @@ class MessageTable {
 
     const ::google::protobuf::Message &DefaultInstance() const { return *default_instance_; }
     const ::google::protobuf::Descriptor *Descriptor() const { return descriptor_; }
+    void SetDescriptorOwner(std::shared_ptr<const void> owner) {
+        descriptor_owner_ = std::move(owner);
+    }
     const ::google::protobuf::FieldDescriptor *PrimaryKeyField() const {
         return primary_key_field_;
     }
@@ -114,6 +124,9 @@ class MessageTable {
     const StringVector &Indexes() const { return indexes_; }
     const std::string &UniqueKey() const { return unique_keys_; }
     void ValidateMessage(const ::google::protobuf::Message &message) const;
+    void ValidatePrimaryKeyMessage(const ::google::protobuf::Message &message) const;
+    void ValidateFieldValue(const ::google::protobuf::Message &message,
+                            const ::google::protobuf::FieldDescriptor *field) const;
     std::string ColumnType(const ::google::protobuf::FieldDescriptor *field) const;
     void SetExpandOnly(bool enabled) { expand_only_ = enabled; }
     bool ExpandOnly() const { return expand_only_; }
@@ -126,6 +139,17 @@ class MessageTable {
     // Schema management ------------------------------------------------------
     std::string CreateTableSql() const;
     std::string SelectColumnsSql() const;
+    void ClearTableMetadata();
+    std::string SelectTableMetadataSql() const;
+    bool OnSelectTableMetadata(const MYSQL_ROW &row, const unsigned long *lengths, uint32_t size);
+    void ClearDependencies();
+    std::string SelectForeignKeysSql() const;
+    bool OnSelectForeignKey(const MYSQL_ROW &row, const unsigned long *lengths, uint32_t size);
+    std::string SelectTriggersSql() const;
+    bool OnSelectTrigger(const MYSQL_ROW &row, const unsigned long *lengths, uint32_t size);
+    SchemaAlignmentPlan PlanSchemaAlignment() const;
+    StringVector BuildMigrationStatements() const;
+    MigrationReport LegacyMigrationReport() const;
     void ClearExistingIndexes() {
         existing_indexes_.clear();
         indexes_known_ = true;
@@ -221,6 +245,9 @@ class MessageTable {
     std::string PrimaryKeyWhereClause(const ::google::protobuf::Message &message,
                                       MYSQL *mysql) const;
 
+    // Descriptors/factory must outlive dynamic default instances and mapper
+    // copies retained by standalone SQLBuilder objects.
+    std::shared_ptr<const void> descriptor_owner_;
     std::shared_ptr<const ::google::protobuf::Message> default_instance_;
     const ::google::protobuf::Descriptor *descriptor_{nullptr};
     ::google::protobuf::MessageOptions options_;
@@ -250,9 +277,11 @@ class MessageTable {
         int sequence = 0;
         std::string name;
         int prefix = 0;
+        bool descending = false;
     };
     struct IndexMeta {
         bool unique = false;
+        std::string name;
         std::string type;
         std::vector<IndexColumn> columns;
     };
@@ -260,6 +289,48 @@ class MessageTable {
     bool indexes_known_{false};
     std::string IndexColumns(const StringVector &fields, bool prefix) const;
     StringVector BuildIndexAlterClauses() const;
+    struct ColumnMatch {
+        const ::google::protobuf::FieldDescriptor *field = nullptr;
+        std::string online_name;
+        const ColumnMeta *meta = nullptr;
+    };
+    std::vector<ColumnMatch> MatchExistingColumns() const;
+    std::string LegacyKeyReason(const ColumnMatch &column) const;
+    std::string AlignedColumnType(const ColumnMatch &column) const;
+    std::string table_engine_;
+    std::string table_collation_;
+    std::optional<uint64_t> online_auto_increment_;
+    bool table_metadata_known_ = false;
+    bool dependencies_known_ = false;
+    StringVector foreign_keys_;
+    StringVector triggers_;
+    auto Members() {
+        return std::tie(descriptor_owner_, default_instance_, descriptor_, options_,
+                        primary_key_field_, registry_key_, table_name_, primary_key_, indexes_,
+                        unique_keys_, auto_increment_key_, auto_increment_, nullable_fields_,
+                        max_lengths_, identity_columns_, tidb_nonclustered_pk_,
+                        tidb_shard_row_id_bits_, tidb_pre_split_regions_, tidb_auto_id_cache_one_,
+                        expand_only_, db_name_, existing_columns_, existing_indexes_,
+                        indexes_known_, table_engine_, table_collation_, online_auto_increment_,
+                        table_metadata_known_, dependencies_known_, foreign_keys_, triggers_);
+    }
+    auto Members() const {
+        return std::tie(descriptor_owner_, default_instance_, descriptor_, options_,
+                        primary_key_field_, registry_key_, table_name_, primary_key_, indexes_,
+                        unique_keys_, auto_increment_key_, auto_increment_, nullable_fields_,
+                        max_lengths_, identity_columns_, tidb_nonclustered_pk_,
+                        tidb_shard_row_id_bits_, tidb_pre_split_regions_, tidb_auto_id_cache_one_,
+                        expand_only_, db_name_, existing_columns_, existing_indexes_,
+                        indexes_known_, table_engine_, table_collation_, online_auto_increment_,
+                        table_metadata_known_, dependencies_known_, foreign_keys_, triggers_);
+    }
 };
+
+void ValidateTableMessage(const ::google::protobuf::Message &message,
+                          const TableOptions &options = {});
+std::string GenerateCreateTableSQLChecked(const ::google::protobuf::Message &message,
+                                          const TableOptions &options = {});
+std::string GenerateCreateTableSQL(const ::google::protobuf::Message &message,
+                                   const TableOptions &options = {}) noexcept;
 
 } // namespace pbmysql
