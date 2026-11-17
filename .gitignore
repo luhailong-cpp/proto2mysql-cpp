@@ -3,3 +3,9 @@
 *.user
 *.suo
 /verification/
+
+# Visual Studio caches and test build outputs
+**/.vs/
+/test/mysql_client/x64/
+/test/mysql_client/Debug/
+/test/mysql_client/Release/
